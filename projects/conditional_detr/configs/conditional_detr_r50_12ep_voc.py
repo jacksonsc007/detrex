@@ -8,7 +8,7 @@ train = get_config("common/train.py").train
 
 batch_size = 4
 total_imgs = 16651
-num_epochs = 50
+num_epochs = 12
 if num_epochs == 12:
     lr_multiplier = default_voc_scheduler(12, 11, 0, batch_size)
 elif num_epochs == 50:
