@@ -238,6 +238,11 @@ def do_train(args, cfg):
         # writers = default_writers(cfg.train.output_dir, cfg.train.max_iter)
         output_dir = cfg.train.output_dir
         PathManager.mkdirs(output_dir)
+
+        # INK: save the config python file to output_dir
+        import os
+        os.system('cp {} {}'.format(args.config_file, output_dir))
+
         writers = [
             CommonMetricPrinter(cfg.train.max_iter),
             JSONWriter(os.path.join(output_dir, "metrics.json")),
