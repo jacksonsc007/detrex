@@ -15,6 +15,8 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from detrex.utils.misc import inverse_sigmoid
 
 from detrex.layers import (
     FFN,
@@ -229,7 +231,10 @@ class ConditionalDetrTransformer(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.embed_dim = self.encoder.embed_dim
-
+        self.encoder_layer = self.encoder.num_layers
+        self.decoder_layer = self.decoder.num_layers
+        assert self.encoder_layer == self.decoder_layer
+        self.num_layers = self.encoder_layer
         self.init_weights()
 
     def init_weights(self):
@@ -237,27 +242,137 @@ class ConditionalDetrTransformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, x, mask, query_embed, pos_embed):
+    def forward(self, x, mask, query_embed, pos_embed, img_true_sizes, img_batched_sizes):
+        """
+        
+        x: 
+            feature from backbone. ( bs, c, h, w)
+        mask: 
+            feature mask for batched images. (bs, h, w)
+        query_embed: 
+            learnable position query embedding for decoder.
+        pos_embed: 
+            positional embeddng for x.
+        img_true_size: 
+            valid images content size.
+        img_batched_size: 
+            batched images have the same shape but different valid content.
+        """
         bs, c, h, w = x.shape
         x = x.view(bs, c, -1).permute(2, 0, 1)
         pos_embed = pos_embed.view(bs, c, -1).permute(2, 0, 1)
         query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
         mask = mask.view(bs, -1)
-        memory = self.encoder(
-            query=x,
-            key=None,
-            value=None,
-            query_pos=pos_embed,
-            query_key_padding_mask=mask,
-        )
-        target = torch.zeros_like(query_embed)
 
-        hidden_state, references = self.decoder(
-            query=target,
-            key=memory,
-            value=memory,
-            key_pos=pos_embed,
-            query_pos=query_embed,
+
+        hidden_states = []
+        references = []
+        hs = torch.zeros_like(query_embed) # initial content query for decoder
+        for layer_id in range(self.num_layers):
+            x, hs, r = self.cascade_layer(x, query_embed, pos_embed, mask, layer_id, hs) # hs also refers to hidden states.
+            r_d = r.detach()
+            hs_d = hs.detach().transpose(0, 1)
+            reference_before_sigmoid = inverse_sigmoid(r_d)
+            tmp = self.bbox_embed(hs_d)
+            tmp[..., :2] += reference_before_sigmoid
+            outputs_coord = tmp.sigmoid() # (bs, num_q, 4)
+            outputs_class = self.class_embed(hs_d).sigmoid() # (bs, num_q, 20)
+            
+            extra_mask = self.mask_from_decoder(outputs_coord, outputs_class, img_true_sizes, img_batched_sizes, (h, w))
+            mask = extra_mask.view(bs, -1)
+
+            hidden_states.append(hs)
+            references.append(r)
+        hidden_states = torch.stack(hidden_states).transpose(1,2)
+        references = torch.stack(references)
+        references = references[0] # conditional detr use the same references point.
+        #exit() # check dim
+
+        return hidden_states, references
+
+    def mask_from_decoder(self, outputs_coord, output_class, img_true_size, img_batched_sizes, feature_size, thr=0.02):
+        bs = outputs_coord.size(0)
+        batched_h, batch_w = img_batched_sizes
+        extra_mask = outputs_coord.new_ones(bs, batched_h, batch_w) # 0 mean valid, 1 means invalid
+        output_class = output_class.max(dim=-1)[0] # (bs, num_query)
+        # output_class = output_class.flatten(0)
+        # bs,2
+        outputs_coord = outputs_coord * img_true_size.repeat(1, 2)[:, None] # TODO check if (x,y,w,h)
+        selected_query_idx = (output_class > thr).nonzero()
+
+        for (img_idx, q_idx) in selected_query_idx:
+            box_coord = outputs_coord[img_idx, q_idx]
+            true_h, true_w = img_true_size[img_idx]
+            l_corner_x = (box_coord[0] - 0.5 * box_coord[2]).clamp_(0).to(torch.int64)
+            l_corner_y = (box_coord[1] - 0.5 * box_coord[3]).clamp_(0).to(torch.int64)
+            r_corner_x = (box_coord[0] + 0.5 * box_coord[2]).clamp_(true_w).to(torch.int64)
+            r_corner_y = (box_coord[1] + 0.5 * box_coord[3]).clamp_(true_h).to(torch.int64)
+            extra_mask[img_idx, l_corner_y:r_corner_y, l_corner_x:r_corner_x] = 0
+        extra_mask = F.interpolate(extra_mask[:, None], feature_size).squeeze(1).to(torch.bool)
+
+        return extra_mask
+
+    def cascade_layer(self, x, query_embed, pos_embed, mask, layer_id, hidden_state):
+        """
+        x:
+            the enhanced backbone feature
+        query_embed: 
+            learnable position query embedding for decoder.
+        pos_embed: 
+            encoder positional encoding for backbone feature.
+        mask:
+            mask for backbone feature.
+        layer_id:
+            current index of encoder and decoder layer.
+        hidden_state:
+            decoder output for box & class prediction.
+        """
+        
+        enc_layer = self.encoder.layers[layer_id]
+        dec_layer = self.decoder.layers[layer_id]
+
+        # get encoder output
+        if not mask.all(): # TODO makeshift for scenarios when all location is invalid
+            memory = enc_layer(x, key=None, value=None, query_pos=pos_embed, query_key_padding_mask=mask)
+        else:
+            memory = x
+        if layer_id == self.num_layers: # special treatment for last encoder layer following the original code.
+            if self.encoder.post_norm_layer is None:
+                memory = self.encoder.post_norm_layer(memory)
+        # get decoder output
+        dec_query_content = hidden_state
+        dec_query_pos = query_embed
+        dec_key_content = memory
+        dec_key_pos = pos_embed
+
+        reference_points_before_sigmoid = self.decoder.ref_point_head(dec_query_pos)
+        reference_points: torch.Tensor = reference_points_before_sigmoid.sigmoid().transpose(0,1)
+        obj_center = reference_points[..., :2].transpose(0, 1)
+        # do not apply transform in position in the first decoder layer
+        if layer_id == 0:
+            position_transform = 1
+        else:
+            position_transform = self.decoder.query_scale(dec_query_content)
+        # get sine embedding for the query vector
+        query_sine_embed = get_sine_pos_embed(obj_center)
+        # apply position transform
+        query_sine_embed = query_sine_embed[..., : self.decoder.embed_dim] * position_transform
+
+        hidden_state = dec_layer(
+            query=dec_query_content,
+            key=dec_key_content,
+            value=dec_key_content,
+            query_pos=dec_query_pos,           
+            key_pos=dec_key_pos,
+            query_sine_embed=query_sine_embed,
+            is_first_layer=(layer_id == 0),
         )
 
-        return hidden_state, references
+        if self.decoder.post_norm_layer is not None:
+            hidden_state = self.decoder.post_norm_layer(hidden_state)
+        
+        if (layer_id == self.num_layers) & (self.decoder.post_norm_layer is not None): # another layernorm for the last output
+            hidden_state = self.decoder.post_norm_layer(hidden_state)
+        
+
+        return memory, hidden_state, reference_points

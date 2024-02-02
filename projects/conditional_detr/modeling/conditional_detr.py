@@ -91,6 +91,7 @@ class ConditionalDETR(nn.Module):
 
         # define leanable object query embed and transformer module
         self.transformer = transformer
+
         self.query_embed = nn.Embedding(num_queries, embed_dim)
 
         # define classification head and box head
@@ -112,6 +113,9 @@ class ConditionalDETR(nn.Module):
         self.select_box_nums_for_evaluation = select_box_nums_for_evaluation
 
         self.init_weights()
+
+        self.transformer.bbox_embed = self.bbox_embed
+        self.transformer.class_embed = self.class_embed
 
     def init_weights(self):
         """Initialize weights for Conditioanl-DETR."""
@@ -151,12 +155,19 @@ class ConditionalDETR(nn.Module):
         if self.training:
             batch_size, _, H, W = images.tensor.shape
             img_masks = images.tensor.new_ones(batch_size, H, W)
+            img_true_sizes = [] 
             for img_id in range(batch_size):
                 img_h, img_w = batched_inputs[img_id]["instances"].image_size
+                img_true_sizes.append((img_h, img_w))
                 img_masks[img_id, :img_h, :img_w] = 0
         else:
             batch_size, _, H, W = images.tensor.shape
+            assert batch_size == 1, "batchsize must be 1 during evaluation"
             img_masks = images.tensor.new_zeros(batch_size, H, W)
+            img_true_sizes = torch.as_tensor((H, W), dtype= img_masks.dtype, device=img_masks.device).repeat(batch_size, 1) # TODO this is weird.
+
+        img_true_sizes = torch.as_tensor(img_true_sizes, dtype = img_masks.dtype, device=img_masks.device)
+        img_batched_sizes = (H, W)
 
         # only use last level feature in Conditional-DETR
         features = self.backbone(images.tensor)[self.in_features[-1]]
@@ -167,7 +178,7 @@ class ConditionalDETR(nn.Module):
         # hidden_states: transformer output hidden feature
         # reference: reference points in format (x, y)  with normalized coordinates in range of [0, 1].
         hidden_states, reference = self.transformer(
-            features, img_masks, self.query_embed.weight, pos_embed
+            features, img_masks, self.query_embed.weight, pos_embed, img_true_sizes=img_true_sizes, img_batched_sizes=img_batched_sizes
         )
 
         reference_before_sigmoid = inverse_sigmoid(reference)

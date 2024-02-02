@@ -1,0 +1,5 @@
+1. Symetrical disign. Same number of dec and enc layers. 
+2. The first encoder layer don't use mask from decoder output.
+3. skip encoder directly if mask from decoder specifies that all locs are invalid.
+4. predictor for box and class are shared among all decoder layers.
+5. fixed threshold for selectio is adopted. Further consider coarse-to-fine design, topk, etc.

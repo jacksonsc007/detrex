@@ -44,8 +44,8 @@ model.device = train.device
 # for VOC dataset
 model.num_classes = 20
 model.criterion.num_classes = 20
-model.transformer.encoder.num_layers=2 
-model.transformer.decoder.num_layers=2 
+model.transformer.encoder.num_layers=3 
+model.transformer.decoder.num_layers=3 
 
 model_code = f"conditional_detr_enc{model.transformer.encoder.num_layers}_dec{model.transformer.decoder.num_layers}"
 
