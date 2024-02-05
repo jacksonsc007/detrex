@@ -1,3 +1,8 @@
+import os
+CODE_VERSION  = os.environ.get("code_version")
+if CODE_VERSION is None:
+    raise ValueError("code version must be specified!")
+
 from detrex.config import get_config
 from .models.conditional_detr_r50 import model
 from configs.common.voc_schedule import default_voc_scheduler
@@ -44,10 +49,11 @@ model.device = train.device
 # for VOC dataset
 model.num_classes = 20
 model.criterion.num_classes = 20
-model.transformer.encoder.num_layers=3 
-model.transformer.decoder.num_layers=3 
+model.transformer.encoder.num_layers=2 
+model.transformer.decoder.num_layers=2 
+model.transformer.topk_ratio = 0.1
 
-model_code = f"cascade_conditional_detr_enc{model.transformer.encoder.num_layers}_dec{model.transformer.decoder.num_layers}"
+model_code = f"cascade_conditional_detr_enc{model.transformer.encoder.num_layers}_dec{model.transformer.decoder.num_layers}_topkratio{model.transformer.topk_ratio}"
 
 # ============= train config ==============================
 
@@ -70,7 +76,7 @@ train.device = "cuda"
 
 # wandb log
 train.wandb.enabled = True
-train.wandb.params.name = "-".join([model_code, dataset_code, setting_code, optim_code, ])
+train.wandb.params.name = "-".join([CODE_VERSION, model_code, dataset_code, setting_code, optim_code, ])
 train.output_dir = "./output/" + "${train.wandb.params.name}"
 #print(train.output_dir)
 #exit()

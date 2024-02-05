@@ -1,5 +1,32 @@
+version 1.0:
 1. Symetrical disign. Same number of dec and enc layers. 
 2. The first encoder layer don't use mask from decoder output.
 3. skip encoder directly if mask from decoder specifies that all locs are invalid.
 4. predictor for box and class are shared among all decoder layers.
 5. fixed threshold for selectio is adopted. Further consider coarse-to-fine design, topk, etc.
+
+TODO: why was the training time nearly multiplied?
+Answer: The generation of mask accounts for that.
+
+6. positional encoding in encoder does not change after remasking.
+
+
+version 1.0.1:
+1. each decoder layer now has its own predictor for mask generation, preconditioned on that each decoder layer receive supervison.
+
+
+This is ill-judged. As only the predictor of last decoder layer has supervision in the training process.
+
+we need to make sure each decoder layer receive supervision.
+
+
+2.  supplant the original fixed threshod scheme with a topk scheme. This makes sure that each image has valid feature locations, as mask with all 1 values(all invalid locations) will generate nan value in the self-attention operation of encoder.
+
+This fixes the bug for the case where there is no valid loc after remasking. Note that use mask.all() as a precondition to circumvent such scenario is not vaiable, cause if one image in a batch have no valid location, mask.all() still is False.
+
+TODO: a fixed threhold is not friendly to the initial training phase where predicator tends to mask unreliable predictions.
+
+
+pending
+3. add a central area prior as constant valid mask area.
+

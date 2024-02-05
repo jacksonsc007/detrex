@@ -23,6 +23,7 @@
 # https://github.com/facebookresearch/detr/blob/main/d2/detr/detr.py
 # ------------------------------------------------------------------------------------------------
 
+INF_INK = -1e20
 
 import math
 from typing import List
@@ -36,6 +37,7 @@ from detrex.utils.misc import inverse_sigmoid
 
 from detectron2.modeling import detector_postprocess
 from detectron2.structures import Boxes, ImageList, Instances
+import copy
 
 
 class ConditionalDETR(nn.Module):
@@ -92,6 +94,7 @@ class ConditionalDETR(nn.Module):
         # define leanable object query embed and transformer module
         self.transformer = transformer
 
+        self.num_queries = num_queries
         self.query_embed = nn.Embedding(num_queries, embed_dim)
 
         # define classification head and box head
@@ -114,8 +117,15 @@ class ConditionalDETR(nn.Module):
 
         self.init_weights()
 
-        self.transformer.bbox_embed = self.bbox_embed
-        self.transformer.class_embed = self.class_embed
+        num_layers = transformer.num_layers
+        self.transformer.bbox_embed = nn.ModuleList(
+            [  copy.deepcopy(self.bbox_embed) for _ in range(num_layers) ]
+        )
+        self.transformer.class_embed = nn.ModuleList(
+            [  copy.deepcopy(self.class_embed) for _ in range(num_layers) ]
+        )
+
+        self.transformer.num_queries = self.num_queries
 
     def init_weights(self):
         """Initialize weights for Conditioanl-DETR."""
@@ -173,6 +183,9 @@ class ConditionalDETR(nn.Module):
         features = self.backbone(images.tensor)[self.in_features[-1]]
         features = self.input_proj(features)
         img_masks = F.interpolate(img_masks[None], size=features.shape[-2:]).to(torch.bool)[0]
+
+        #img_masks = img_masks.float().masked_fill(-INF_INK, img_masks) # INK. This helps avoid nan value in nn.MultiheadAttention. 
+
         pos_embed = self.position_embedding(img_masks)
 
         # hidden_states: transformer output hidden feature
@@ -182,14 +195,17 @@ class ConditionalDETR(nn.Module):
         )
 
         reference_before_sigmoid = inverse_sigmoid(reference)
-        outputs_coords = []
-        for lvl in range(hidden_states.shape[0]):
-            tmp = self.bbox_embed(hidden_states[lvl])
+        outputs_coord_all_layer = []
+        outputs_class_all_layer = []
+        for layer in range(hidden_states.shape[0]):
+            tmp = self.transformer.bbox_embed[layer](hidden_states[layer])
             tmp[..., :2] += reference_before_sigmoid
-            outputs_coord = tmp.sigmoid()
-            outputs_coords.append(outputs_coord)
-        outputs_coord = torch.stack(outputs_coords)
-        outputs_class = self.class_embed(hidden_states)
+            outputs_coord_layer = tmp.sigmoid()
+            output_class_layer = self.transformer.class_embed[layer](hidden_states[layer])
+            outputs_coord_all_layer.append(outputs_coord_layer)
+            outputs_class_all_layer.append(output_class_layer)
+        outputs_coord = torch.stack(outputs_coord_all_layer)
+        outputs_class = torch.stack(outputs_class_all_layer)
 
         output = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord[-1]}
         if self.aux_loss:

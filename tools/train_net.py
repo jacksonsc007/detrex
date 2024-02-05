@@ -242,6 +242,10 @@ def do_train(args, cfg):
         # INK: save the config python file to output_dir
         import os
         os.system('cp {} {}'.format(args.config_file, output_dir))
+        # save source code
+        project_dir = os.path.join(*os.path.dirname(args.config_file).split('/')[:2])
+        code_dir = os.path.join(project_dir, "modeling")
+        os.system('cp -r {} {}'.format(code_dir, output_dir))
 
         writers = [
             CommonMetricPrinter(cfg.train.max_iter),
