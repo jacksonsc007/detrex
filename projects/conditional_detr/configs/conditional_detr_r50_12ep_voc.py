@@ -70,7 +70,7 @@ train.device = "cuda"
 
 # wandb log
 train.wandb.enabled = True
-train.wandb.params.name = "-".join([model_code, dataset_code, setting_code, optim_code, ])
+train.wandb.params.name = "-".join(["bug_fixing", model_code, dataset_code, setting_code, optim_code, ])
 train.output_dir = "./output/" + "${train.wandb.params.name}"
 #print(train.output_dir)
 #exit()
