@@ -208,13 +208,13 @@ class DNDETR(nn.Module):
 
         # for vallina dn-detr, label queries in the matching part is encoded as "no object" (the last class)
         # in the label encoder.
-        matching_label_query = self.denoising_generator.label_encoder(
+        matching_label_query = self.denoising_generator.label_encoder( # (num_queries, feat_channel - 1)
             torch.tensor(self.num_classes).to(self.device)
         ).repeat(self.num_queries, 1)
         indicator_for_matching_part = torch.zeros([self.num_queries, 1]).to(self.device)
         matching_label_query = torch.cat(
             [matching_label_query, indicator_for_matching_part], 1
-        ).repeat(batch_size, 1, 1)
+        ).repeat(batch_size, 1, 1) #(num_queris, feat_channel)
         matching_box_query = self.anchor_box_embed.weight.repeat(batch_size, 1, 1)
 
         if targets is None:

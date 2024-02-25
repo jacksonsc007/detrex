@@ -60,7 +60,7 @@ class ConditionalDetrTransformerEncoder(TransformerLayerSequence):
                     activation=activation,
                 ),
                 norm=nn.LayerNorm(normalized_shape=embed_dim),
-                operation_order=("self_attn", "norm", "ffn", "norm"),
+                operation_order=("encoder_cross_attn", "norm", "ffn", "norm"),
             ),
             num_layers=num_layers,
         )
@@ -240,6 +240,7 @@ class ConditionalDetrTransformer(nn.Module):
         self.init_weights()
 
         self.topk_ratio = topk_ratio
+        self.use_sparse_key = (self.topk_ratio < 1 ) and (self.topk_ratio > 0)
 
     def init_weights(self):
         for p in self.parameters():
@@ -278,12 +279,18 @@ class ConditionalDetrTransformer(nn.Module):
         hs = torch.zeros_like(query_embed) # initial content query for decoder
         topk = int( self.num_queries * self.topk_ratio )
         padding_mask = mask
+        encoder_key = x
+        encoder_value = x
+        encoder_key_pos = pos_embed
+        query_key_padding_mask = mask
         for layer_id in range(self.num_layers):
             masks.append(mask)
-            x, hs, r = self.cascade_layer(x, query_embed, pos_embed, mask, layer_id, hs) # hs also refers to hidden states.
+            x, hs, r = self.cascade_layer(x, query_embed, pos_embed, query_key_padding_mask, layer_id, hs, 
+                                          encoder_key=encoder_key, encoder_value=encoder_value, encoder_key_pos=encoder_key_pos) # hs also refers to hidden states.
             assert (hs.isfinite().all())
+
             # the last layer don't need to re-mask
-            if layer_id != (self.num_layers - 1):
+            if self.use_sparse_key and layer_id != (self.num_layers - 1):
                 r_d = r.detach()
                 hs_d = hs.detach().transpose(0, 1)
                 reference_before_sigmoid = inverse_sigmoid(r_d)
@@ -293,14 +300,29 @@ class ConditionalDetrTransformer(nn.Module):
                 outputs_class = self.class_embed[layer_id](hs_d).sigmoid() # (bs, num_q, 20)
             
                 extra_mask = self.mask_from_decoder(outputs_coord, outputs_class, img_true_sizes, img_batched_sizes, (h, w), topk, valid_size)
-                mask = ( extra_mask.view(bs, -1) | padding_mask) # only 0 | 0 get 0 (valid)
-                mask = mask.float().masked_fill(mask, -INK_INF) # avoid to generate nan in the softmax operation in nn.MultiheadAttention.
-                
-                # mask = mask.view(bs, h, w) 
-                # center_y, center_x = torch.unbind((0.5 * valid_size).long(), dim=-1)
-                # mask[range(bs), center_y, center_x] = False
-                # mask = mask.view(bs, -1)
-                assert id(mask) != id(padding_mask)
+                object_mask = ( extra_mask.view(bs, -1) | padding_mask).int() # only 0 | 0 get 0 (valid)
+                obj_num = object_mask.sum(dim=1) # object tokens for imgs in a batch
+                obj_max_num = max(obj_num) # get the max value for batch operation
+                assert x.size() == torch.Size([h*w, bs, c])
+
+                obj_idx = torch.topk(object_mask, obj_max_num, 1)[1] # (bs, obj_max_num)
+                sparse_key = x.gather(dim=0, index=obj_idx.permute(1, 0)[:, :, None].repeat(1, 1, c)) # (obj_max_num, bs, c)
+                sparse_key_pos = pos_embed.gather(dim=0, index=obj_idx.permute(1, 0)[:, :, None].repeat(1, 1, c)) # (obj_max_num, bs, c)
+                # fill padding locations with 0
+                for img_id in range(bs):
+                    valid_num = obj_num[img_id]
+                    sparse_key[valid_num: , img_id, :] = 0 
+                    sparse_key_pos[valid_num: , img_id, :] = 0 
+                           
+                # todo check gradient
+                encoder_key = sparse_key
+                encoder_value = encoder_key
+                encoder_key_pos = sparse_key_pos
+                query_key_padding_mask = None # keys are selected and all valid (invalid have already been set to 0)
+            elif not self.use_sparse_key:
+                encoder_key = x
+                encoder_value = x
+                encoder_key_pos = pos_embed
 
             hidden_states.append(hs)
             references.append(r)
@@ -312,29 +334,42 @@ class ConditionalDetrTransformer(nn.Module):
         return hidden_states, references
 
     def mask_from_decoder(self, output_coord, output_class, img_true_size, img_batched_sizes, feature_size, topk, valid_feature_size):
+        """
+        img_true_size: (bs, 2)
+        """
         bs, num_queries, _= output_coord.shape
         assert topk < num_queries
-        batched_h, batch_w = img_batched_sizes
-        extra_mask = output_coord.new_ones(bs, *feature_size, dtype=torch.bool) # 0 mean valid, 1 means invalid
+        batched_h, batched_w = img_batched_sizes
         output_class = output_class.max(dim=-1)[0] # (bs, num_query)
         topkid = output_class.topk(topk, dim= -1)[1] # (bs, topk)
         topk_boxes = torch.gather(output_coord, 1, topkid[..., None].repeat(1, 1, 4)) # (bs, topk, 4)
-        topk_boxes = box_cxcywh_to_xyxy(topk_boxes)
-        valid_feature_size = valid_feature_size.repeat(1, 2).view(bs, 1, 4)
+        topk_boxes = box_cxcywh_to_xyxy(topk_boxes) # (bs, topk, 4)
+        # valid_feature_size = valid_feature_size.repeat(1, 2).view(bs, 1, 4)
+        img_true_size = img_true_size.repeat(1,2).view(bs, 1, 4)
+        box_range = img_true_size * topk_boxes # (bs, topk, 4) . (x1, y1, x2, y2)
 
-        # we omit the difference between true size and batched size here
-        box_feature_range = ( topk_boxes * valid_feature_size ).floor().to(torch.int64)
-        assert  (box_feature_range[..., :2] <= box_feature_range[..., 2:]).all()
+        grid_y, grid_x = torch.meshgrid(torch.arange(batched_h), torch.arange(batched_w))
 
-        for img_idx in range(bs):
-            for loc_id in range(topk):
-                lx, ly, rx, ry = box_feature_range[img_idx, loc_id]
-                extra_mask[img_idx][ly:ry, lx:rx] = False
-       
-        
-        return extra_mask
+        grid_y = grid_y.view(1 , batched_h, batched_w, 1).to(topk_boxes.device)
+        grid_x = grid_x.view(1 , batched_h, batched_w, 1).to(topk_boxes.device)
+        box_range = box_range.view(bs, 1, 1, topk, 4)
+        x1, y1, x2, y2 = torch.split(box_range, 1, -1)
+        x1 = x1.squeeze(-1)
+        y1 = y1.squeeze(-1)
+        x2 = x2.squeeze(-1)
+        y2 = y2.squeeze(-1)
 
-    def cascade_layer(self, x, query_embed, pos_embed, mask, layer_id, hidden_state):
+        if_in_box = ( grid_x > x1 ) & \
+                    ( grid_x < x2 ) & \
+                    ( grid_y > y1 ) & \
+                    ( grid_y < y2 )
+        if_in_any_box = if_in_box.any(dim=-1) # (bs, batched_h, batched_w)
+        mask = (~if_in_any_box).float() # 0 means valid
+        mask = F.interpolate(mask[:, None], feature_size).bool().squeeze(1)
+        return mask
+
+    def cascade_layer(self, x, query_embed, pos_embed, query_key_padding_mask, layer_id, hidden_state, 
+                      encoder_key, encoder_value, encoder_key_pos):
         """
         x:
             the enhanced backbone feature
@@ -354,7 +389,7 @@ class ConditionalDetrTransformer(nn.Module):
         dec_layer = self.decoder.layers[layer_id]
 
         # get encoder output
-        memory = enc_layer(x, key=None, value=None, query_pos=pos_embed, query_key_padding_mask=mask)
+        memory = enc_layer(x, key=encoder_key, value=encoder_value, key_pos=encoder_key_pos, query_pos=pos_embed, query_key_padding_mask=query_key_padding_mask)
         assert memory.isfinite().all()
         if layer_id == self.num_layers: # special treatment for last encoder layer following the original code.
             if self.encoder.post_norm_layer is None:

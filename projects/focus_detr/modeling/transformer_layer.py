@@ -277,6 +277,9 @@ class Focus_DETR_BaseTransformerLayer(nn.Module):
         """Forward function for `BaseTransformerLayer`.
         **kwargs contains the specific arguments of attentions.
         Args:
+            foreground_pre_layer: foreground score
+            score_tgt: category score for query enhancement.
+
             query (torch.Tensor): Query embeddings with shape
                 `(num_query, bs, embed_dim)` or `(bs, num_query, embed_dim)`
                 which should be specified follows the attention module used in
@@ -334,6 +337,7 @@ class Focus_DETR_BaseTransformerLayer(nn.Module):
             elif layer == "OESM":
                 ori_tgt = query
                 mc_score=score_tgt.max(-1)[0]*foreground_pre_layer
+                # TODO Ink, note the number of self.topk_sa here
                 select_tgt_index = torch.topk(mc_score, self.topk_sa, dim=1)[1]  # bs, nq
                 select_tgt = torch.gather(query, 1, select_tgt_index.unsqueeze(-1).repeat(1, 1, 256))
                 select_pos = torch.gather(query_pos, 1, select_tgt_index.unsqueeze(-1).repeat(1, 1, 256))

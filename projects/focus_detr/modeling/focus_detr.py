@@ -326,7 +326,7 @@ class FOCUS_DETR(nn.Module):
         dn_number = dn_number * 2
         known = [(torch.ones_like(t["labels"])).cuda() for t in targets]
         batch_size = len(known)
-        known_num = [sum(k) for k in known]
+        known_num = [sum(k) for k in known] # targets for each 
         if int(max(known_num)) == 0:
             return None, None, None, None
 

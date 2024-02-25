@@ -13,6 +13,7 @@ train = get_config("common/train.py").train
 
 batch_size = 4
 total_imgs = 16651
+iters_per_epoch = int(total_imgs / batch_size)
 num_epochs = 12
 if num_epochs == 12:
     lr_multiplier = default_voc_scheduler(12, 11, 0, batch_size)
@@ -36,7 +37,8 @@ dataloader.evaluator.output_dir = train.output_dir
 dataset_code = "voc"
 
 # ============ modify optimizer config ===================
-optimizer.lr = 1e-4
+base_lr = 1e-4
+optimizer.lr = base_lr * (batch_size / 16)
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
 optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
@@ -49,8 +51,8 @@ model.device = train.device
 # for VOC dataset
 model.num_classes = 20
 model.criterion.num_classes = 20
-model.transformer.encoder.num_layers=2 
-model.transformer.decoder.num_layers=2 
+model.transformer.encoder.num_layers=3 
+model.transformer.decoder.num_layers=3 
 model.transformer.topk_ratio = 0.1
 
 model_code = f"cascade_conditional_detr_enc{model.transformer.encoder.num_layers}_dec{model.transformer.decoder.num_layers}_topkratio{model.transformer.topk_ratio}"
@@ -59,12 +61,14 @@ model_code = f"cascade_conditional_detr_enc{model.transformer.encoder.num_layers
 
 train.init_checkpoint = "detectron2://ImageNetPretrained/torchvision/R-50.pkl"
 train.max_iter = int( num_epochs * total_imgs / batch_size)
-# run evaluation every 5000 iters
-train.eval_period = 5000
+
 # log training infomation every 20 iters
 train.log_period = 20
-# save checkpoint every 5000 iters
-train.checkpointer.period = 5000
+
+# save checkpoint every epoch
+train.checkpointer.period = (int(iters_per_epoch / train.log_period) + 1) * train.log_period # tmp workaround for bug in wandbwriter
+# run evaluation every epoch
+train.eval_period = (int(iters_per_epoch / train.log_period) + 1)* train.log_period
 
 # gradient clipping for training
 train.clip_grad.enabled = True
@@ -76,6 +80,7 @@ train.device = "cuda"
 
 # wandb log
 train.wandb.enabled = True
+train.wandb.params.project = "ConditionalDETR"
 train.wandb.params.name = "-".join([CODE_VERSION, model_code, dataset_code, setting_code, optim_code, ])
 train.output_dir = "./output/" + "${train.wandb.params.name}"
 #print(train.output_dir)

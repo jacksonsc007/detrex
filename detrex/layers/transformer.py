@@ -57,10 +57,10 @@ class BaseTransformerLayer(nn.Module):
         operation_order: tuple = None,
     ):
         super(BaseTransformerLayer, self).__init__()
-        assert set(operation_order).issubset({"self_attn", "norm", "cross_attn", "ffn"})
+        assert set(operation_order).issubset({"self_attn", "encoder_cross_attn", "norm", "cross_attn", "ffn"})
 
         # count attention nums
-        num_attn = operation_order.count("self_attn") + operation_order.count("cross_attn")
+        num_attn = operation_order.count("self_attn") + operation_order.count("encoder_cross_attn") + operation_order.count("cross_attn")
 
         if isinstance(attn, nn.Module):
             attn = [copy.deepcopy(attn) for _ in range(num_attn)]
@@ -77,7 +77,7 @@ class BaseTransformerLayer(nn.Module):
         self.attentions = nn.ModuleList()
         index = 0
         for operation_name in operation_order:
-            if operation_name in ["self_attn", "cross_attn"]:
+            if operation_name in ["self_attn", "encoder_cross_attn", "cross_attn"]:
                 self.attentions.append(attn[index])
                 index += 1
 
@@ -159,6 +159,21 @@ class BaseTransformerLayer(nn.Module):
                     identity if self.pre_norm else None,
                     query_pos=query_pos,
                     key_pos=query_pos,
+                    attn_mask=attn_masks[attn_index],
+                    key_padding_mask=query_key_padding_mask,
+                    **kwargs,
+                )
+                attn_index += 1
+                identity = query
+            elif layer == "encoder_cross_attn":
+                assert all(_ is not None for _ in [key, value, key_pos])
+                query = self.attentions[attn_index](
+                    query,
+                    key,
+                    value,
+                    identity if self.pre_norm else None,
+                    query_pos=query_pos,
+                    key_pos=key_pos,
                     attn_mask=attn_masks[attn_index],
                     key_padding_mask=query_key_padding_mask,
                     **kwargs,

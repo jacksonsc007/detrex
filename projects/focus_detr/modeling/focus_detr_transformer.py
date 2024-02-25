@@ -109,7 +109,7 @@ class FOCUS_DETRTransformerEncoder(TransformerLayerSequence):
             reference_points = torch.gather(ori_reference_points.view(B_, N_, -1), 1,
                                         foreground_inds[layer_id].unsqueeze(-1).repeat(1, 1, S_ * P_)).view(B_, -1, S_,P_)
             dropflag = False
-            score_tgt=self.enhance_MCSP[layer_id](query)
+            score_tgt=self.enhance_MCSP[layer_id](query) # multi-category score predictor in paper.
             query = layer(
                 foreground_pre_layer,
                 score_tgt,
