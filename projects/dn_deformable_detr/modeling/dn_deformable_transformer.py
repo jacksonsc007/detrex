@@ -113,16 +113,19 @@ class DNDeformableDetrTransformerEncoder(TransformerLayerSequence):
         **kwargs,
     ):
         layer = self.layers[layer_idx]
+        assert kwargs.get("reference_points", None) is not None
         query = layer(
             query,
             key,
             value,
             query_pos=query_pos,
+            key_pos=key_pos,
             attn_masks=attn_masks,
             query_key_padding_mask=query_key_padding_mask,
             key_padding_mask=key_padding_mask,
             **kwargs,
         )
+        # post-norm for last encoder layer
         if (layer_idx == self.num_layers - 1 ) and ( self.post_norm_layer is not None ):
             query = self.post_norm_layer(query)
         return query
@@ -460,37 +463,62 @@ class DNDeformableDetrTransformer(nn.Module):
         )
 
         decoder_reference_points = None
+        decoder_query = None
+        memory = feat_flatten
+
+        dec_inter_states = []
+        dec_inter_references = []
+        enc_outputs_class = []
+        enc_outputs_coord_unact = []
+        init_dec_refs = []
         for stage_id in range(self.num_stages):
-            memory, decoder_query, decoder_reference_points = self.cascade_stage(
+            memory, decoder_query, decoder_reference_points, \
+            enc_output_cls, enc_output_coord, init_dec_ref = self.cascade_stage(
                 stage_id=stage_id,
                 encoder_query=memory,
                 encoder_key=None,
                 encoder_value=None,
                 encoder_query_pos=lvl_pos_embed_flatten,
-                encoder_attn_masks = None,
-                encoder_reference_points=encoder_reference_points,
+                encoder_key_pos=None,
+                encoder_attn_masks=None,
                 encoder_query_key_padding_mask=mask_flatten,
+                encoder_key_padding_mask=None,
+                encoder_reference_points=encoder_reference_points,
+                # ------------------------------------------------
                 decoder_query=decoder_query,
                 decoder_query_pos=None,
-                decoder_reference_points=decoder_reference_points,
-                decoder_attn_masks = attn_masks,
+                decoder_key_pos=None,
+                decoder_attn_masks=attn_masks,
+                decoder_query_key_padding_mask=None,
                 decoder_key_padding_mask=mask_flatten,
+                decoder_reference_points=decoder_reference_points,
+                # ------------------------------------------------
                 spatial_shapes=spatial_shapes,
                 level_start_index=level_start_index,
                 valid_ratios=valid_ratios,
                 **kwargs
             )
+            
+            # get the results of each stage
+            dec_inter_states.append(decoder_query)
+            dec_inter_references.append(decoder_reference_points)
+            enc_outputs_class.append(enc_output_cls)
+            enc_outputs_coord_unact.append(enc_output_coord)
+            init_dec_refs.append(init_dec_ref)
+        dec_inter_references = torch.stack(dec_inter_references)
+        dec_inter_states = torch.stack(dec_inter_states)
+        init_reference_out = init_dec_refs[0]
+        assert init_reference_out is not None
 
-        inter_references_out = inter_references
         if self.as_two_stage:
             return (
-                inter_states,
+                dec_inter_states,
                 init_reference_out,
-                inter_references_out,
-                enc_outputs_class,
+                dec_inter_references,
+                enc_outputs_class, # refers to first stage encoder output
                 enc_outputs_coord_unact,
             )
-        return inter_states, init_reference_out, inter_references_out, None, None
+        return dec_inter_states, init_reference_out, dec_inter_references, None, None
 
 
     def cascade_stage(
@@ -502,15 +530,16 @@ class DNDeformableDetrTransformer(nn.Module):
         encoder_query_pos,
         encoder_key_pos,
         encoder_attn_masks,
-        encoder_reference_points,
         encoder_query_key_padding_mask,
         encoder_key_padding_mask,
+        encoder_reference_points,
         decoder_query,
         decoder_query_pos,
-        decoder_query_embed,
-        decoder_reference_points,
+        decoder_key_pos,
         decoder_attn_masks,
+        decoder_query_key_padding_mask,
         decoder_key_padding_mask,
+        decoder_reference_points,
         spatial_shapes,
         level_start_index,
         valid_ratios,
@@ -536,53 +565,58 @@ class DNDeformableDetrTransformer(nn.Module):
             **kwargs,
         )
 
-        bs, _, c = memory.shape
-        if self.as_two_stage:
-            assert input_box_query is None, "query_embed should be None in two-stage"
-            output_memory, output_proposals = self.gen_encoder_output_proposals(
-                memory, encoder_query_key_padding_mask, spatial_shapes
-            )
-            # output_memory: bs, num_tokens, c
-            # output_proposals: bs, num_tokens, 4. unsigmoided.
-            # output_proposals: bs, num_tokens, 4
+        # we only use two stage for the 1st stage #TODO might improve
+        init_reference_out = None
+        if stage_id == 0:
+            assert decoder_reference_points is None
+            if self.as_two_stage:
+                assert input_box_query is None, "query_embed should be None in two-stage"
+                output_memory, output_proposals = self.gen_encoder_output_proposals(
+                    memory, encoder_query_key_padding_mask, spatial_shapes
+                )
+                # output_memory: bs, num_tokens, c
+                # output_proposals: bs, num_tokens, 4. unsigmoided.
+                # output_proposals: bs, num_tokens, 4
 
-            enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)
-            enc_outputs_coord_unact = (
-                self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
-            )  # unsigmoided.
+                enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)
+                enc_outputs_coord_unact = (
+                    self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
+                )  # unsigmoided.
 
-            topk = self.two_stage_num_proposals
-            topk_proposals = torch.topk(enc_outputs_class.max(-1)[0], topk, dim=1)[1]
+                topk = self.two_stage_num_proposals
+                topk_proposals = torch.topk(enc_outputs_class.max(-1)[0], topk, dim=1)[1]
 
-            # extract region proposal boxes
-            topk_coords_unact = torch.gather(
-                enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
-            )  # unsigmoided.
-            reference_points = topk_coords_unact.detach().sigmoid()
-            init_reference_out = reference_points
+                # extract region proposal boxes
+                topk_coords_unact = torch.gather(
+                    enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
+                )  # unsigmoided.
+                reference_points = topk_coords_unact.detach().sigmoid()
+                init_reference_out = reference_points
 
-            # extract region features
-            target_unact = torch.gather(
-                output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, output_memory.shape[-1])
-            )
-            target = target_unact.detach()
-        else:
-            reference_points = input_box_query.sigmoid()
-            target = input_label_query
-            init_reference_out = reference_points
-        
-        output = decoder_query
+                # extract region features
+                target_unact = torch.gather(
+                    output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, output_memory.shape[-1])
+                )
+                target = target_unact.detach()
+            else:
+                reference_points = input_box_query.sigmoid()
+                target = input_label_query
+                init_reference_out = reference_points
+            decoder_reference_points = reference_points
+            decoder_query = target
+
         output, reference_points = self.decoder.cascade_stage_decoder_part(
             layer_idx=stage_id,
-            output=output,
+            query=decoder_query,
             key=memory,
             value=memory,
-            query_pos=None,
-            key_pos=None,
+            query_pos=decoder_query_pos,
+            key_pos=decoder_key_pos,
             attn_masks=decoder_attn_masks,
-            query_key_padding_mask=None,
+            query_key_padding_mask=decoder_query_key_padding_mask,
             key_padding_mask=decoder_key_padding_mask,
-            reference_point=decoder_reference_points
+            reference_point=decoder_reference_points,
             valid_ratios=valid_ratios,
             **kwargs
         )
+        return memory, output, reference_points, enc_outputs_class, enc_outputs_coord_unact, init_reference_out
