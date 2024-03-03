@@ -255,7 +255,7 @@ class DNDeformableDetrTransformerDecoder(TransformerLayerSequence):
         pos_scale = self.query_scale(output) if layer_idx != 0 else 1
         query_pos = pos_scale * raw_query_pos
 
-        layer = self.layers(layer_idx)
+        layer = self.layers[layer_idx]
         output = layer(
             output,
             key,
@@ -468,8 +468,8 @@ class DNDeformableDetrTransformer(nn.Module):
 
         dec_inter_states = []
         dec_inter_references = []
-        enc_outputs_class = []
-        enc_outputs_coord_unact = []
+        enc_inter_outputs_class = []
+        enc_inter_outputs_coord_unact = []
         init_dec_refs = []
         for stage_id in range(self.num_stages):
             memory, decoder_query, decoder_reference_points, \
@@ -496,19 +496,24 @@ class DNDeformableDetrTransformer(nn.Module):
                 spatial_shapes=spatial_shapes,
                 level_start_index=level_start_index,
                 valid_ratios=valid_ratios,
+                # ------------------------------------------------
+                input_box_query=input_box_query,
+                input_label_query=input_label_query,
                 **kwargs
             )
             
             # get the results of each stage
             dec_inter_states.append(decoder_query)
             dec_inter_references.append(decoder_reference_points)
-            enc_outputs_class.append(enc_output_cls)
-            enc_outputs_coord_unact.append(enc_output_coord)
+            enc_inter_outputs_class.append(enc_output_cls)
+            enc_inter_outputs_coord_unact.append(enc_output_coord)
             init_dec_refs.append(init_dec_ref)
         dec_inter_references = torch.stack(dec_inter_references)
         dec_inter_states = torch.stack(dec_inter_states)
         init_reference_out = init_dec_refs[0]
         assert init_reference_out is not None
+        enc_outputs_class = enc_inter_outputs_class[0]
+        enc_outputs_coord_unact = enc_inter_outputs_coord_unact[0]
 
         if self.as_two_stage:
             return (
@@ -567,6 +572,8 @@ class DNDeformableDetrTransformer(nn.Module):
 
         # we only use two stage for the 1st stage #TODO might improve
         init_reference_out = None
+        enc_outputs_class = None
+        enc_outputs_coord_unact = None
         if stage_id == 0:
             assert decoder_reference_points is None
             if self.as_two_stage:
@@ -604,8 +611,8 @@ class DNDeformableDetrTransformer(nn.Module):
                 init_reference_out = reference_points
             decoder_reference_points = reference_points
             decoder_query = target
-
-        output, reference_points = self.decoder.cascade_stage_decoder_part(
+        assert decoder_reference_points is not None
+        output, new_reference_points = self.decoder.cascade_stage_decoder_part(
             layer_idx=stage_id,
             query=decoder_query,
             key=memory,
@@ -615,8 +622,10 @@ class DNDeformableDetrTransformer(nn.Module):
             attn_masks=decoder_attn_masks,
             query_key_padding_mask=decoder_query_key_padding_mask,
             key_padding_mask=decoder_key_padding_mask,
-            reference_point=decoder_reference_points,
+            reference_points=decoder_reference_points,
             valid_ratios=valid_ratios,
+            spatial_shapes=spatial_shapes,
+            level_start_index=level_start_index,
             **kwargs
         )
-        return memory, output, reference_points, enc_outputs_class, enc_outputs_coord_unact, init_reference_out
+        return memory, output, new_reference_points, enc_outputs_class, enc_outputs_coord_unact, init_reference_out
