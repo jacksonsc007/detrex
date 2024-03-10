@@ -309,6 +309,15 @@ class MultiScaleDeformableAttention(nn.Module):
             self.num_points,
         )
 
+        # Ink added
+        N, Len_q, n_heads, n_levels, n_points, _ = sampling_offsets.size()
+        if reference_points.ndim == 4:
+            # dim 4 represents the original design
+            reference_points = reference_points[:, :, None, :, None, :]
+        else:
+            assert reference_points.size() == torch.Size([N, Len_q, n_levels, 1, 4]) 
+            reference_points = reference_points[:, :, None] # add heads dimension
+
         # bs, num_query, num_heads, num_levels, num_points, 2
         if reference_points.shape[-1] == 2:
             
@@ -319,15 +328,15 @@ class MultiScaleDeformableAttention(nn.Module):
             
             offset_normalizer = torch.stack([spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
             sampling_locations = (
-                reference_points[:, :, None, :, None, :]
+                reference_points
                 + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
             )
         elif reference_points.shape[-1] == 4:
             sampling_locations = (
-                reference_points[:, :, None, :, None, :2]
+                reference_points[..., :2]
                 + sampling_offsets
                 / self.num_points
-                * reference_points[:, :, None, :, None, 2:]
+                * reference_points[..., 2:]
                 * 0.5
             )
         else:
@@ -360,7 +369,7 @@ class MultiScaleDeformableAttention(nn.Module):
         if not self.batch_first:
             output = output.permute(1, 0, 2)
 
-        return self.dropout(output) + identity
+        return self.dropout(output) + identity, sampling_locations, attention_weights
 
 
 def create_dummy_class(klass, dependency, message=""):

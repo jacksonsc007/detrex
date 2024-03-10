@@ -256,7 +256,7 @@ class DNDeformableDetrTransformerDecoder(TransformerLayerSequence):
         query_pos = pos_scale * raw_query_pos
 
         layer = self.layers[layer_idx]
-        output = layer(
+        output, decoder_sampling_locations, decoder_attention_weights = layer(
             output,
             key,
             value,
@@ -281,7 +281,7 @@ class DNDeformableDetrTransformerDecoder(TransformerLayerSequence):
                 new_reference_points[..., :2] = tmp[..., :2] + inverse_sigmoid(reference_points)
                 new_reference_points = new_reference_points.sigmoid()
             reference_points = new_reference_points.detach()
-        return output, reference_points
+        return output, reference_points, decoder_sampling_locations, decoder_attention_weights
 
 
 
@@ -391,9 +391,13 @@ class DNDeformableDetrTransformer(nn.Module):
             ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H)
             ref_x = ref_x.reshape(-1)[None] / (valid_ratios[:, None, lvl, 0] * W)
             ref = torch.stack((ref_x, ref_y), -1)
+            wh = torch.ones_like(ref) * 0.05 
+            # wh = torch.ones_like(ref) * 0.05 * (2.0**lvl) # relative to real size
+            ref = torch.cat([ref, wh], dim=2)
             reference_points_list.append(ref)
         reference_points = torch.cat(reference_points_list, 1)
-        reference_points = reference_points[:, :, None] * valid_ratios[:, None]
+        # convert normalized value relative to real image size to padded image size 
+        reference_points = reference_points[:, :, None] * torch.cat([valid_ratios, valid_ratios], -1)[:, None] # (bs,all_lvl_num, 1, 4) * (bs, 1, num_lvl, 4)
         return reference_points
 
     def get_valid_ratio(self, mask):
@@ -458,13 +462,14 @@ class DNDeformableDetrTransformer(nn.Module):
         )
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in multi_level_masks], 1)
 
-        encoder_reference_points = self.get_reference_points(
+        fixed_encoder_reference_boxes = self.get_reference_points(
             spatial_shapes, valid_ratios, device=feat.device
         )
 
         decoder_reference_points = None
         decoder_query = None
         memory = feat_flatten
+        encoder_reference_points = fixed_encoder_reference_boxes
 
         dec_inter_states = []
         dec_inter_references = []
@@ -473,7 +478,8 @@ class DNDeformableDetrTransformer(nn.Module):
         init_dec_refs = []
         for stage_id in range(self.num_stages):
             memory, decoder_query, decoder_reference_points, \
-            enc_output_cls, enc_output_coord, init_dec_ref = self.cascade_stage(
+            enc_output_cls, enc_output_coord, init_dec_ref, \
+            decoder_sampling_locations, decoder_attention_weights= self.cascade_stage(
                 stage_id=stage_id,
                 encoder_query=memory,
                 encoder_key=None,
@@ -501,6 +507,48 @@ class DNDeformableDetrTransformer(nn.Module):
                 input_label_query=input_label_query,
                 **kwargs
             )
+
+            bs, n_all_q, c = decoder_query.size()
+            decoder_matching_query = decoder_query.clone().detach()[:, self.num_noised_queries:]
+            decoder_matching_query_rf = decoder_reference_points.clone().detach()[:, self.num_noised_queries:]
+            N, Len_q, n_heads, n_levels, n_points, _ = decoder_sampling_locations.size()
+            sampling_locations = decoder_sampling_locations.clone().detach()[:, self.num_noised_queries:].unsqueeze(1) # adds layer dim
+            attention_weights = decoder_attention_weights.clone().detach()[:, self.num_noised_queries:].unsqueeze(1)
+            
+            # (bs, num_all_lvl_tokens, num_matching_queries)
+            decoder_cross_attention_map =attn_map_to_flat_grid(spatial_shapes, level_start_index, sampling_locations, attention_weights)
+
+            max_attn_weight, max_query_idx = decoder_cross_attention_map.max(dim=2)
+            # max_attn_weight2, max_query_idx2 = decoder_cross_attention_map[:, :, :self.num_queries_one2one].max(dim=2)
+            new_enc_refs = []
+            self.attn_weight_thr = 0.1
+            for img_id in range(N):
+                object_token_idx = (max_attn_weight[img_id] > self.attn_weight_thr).nonzero().squeeze(1)
+                # object_token_idx2 = (max_attn_weight2[img_id] > 0).nonzero().squeeze(1)
+
+                # valid_ratio1 = len(object_token_idx) / num_tokens_all_lvl
+                # valid_ratio2 = len(object_token_idx2) / num_tokens_all_lvl
+                    
+                if len(object_token_idx) !=0:
+                    valid_obj_query_idx = (max_query_idx[img_id])[object_token_idx]
+                    # encoder_reference_boxes[0]: (num_all_lvl_tokens, num_levels, 4)
+                    # decoder_reference_points: (N, Len_q, 4)
+                    per_img_dec_ref_box = (decoder_matching_query_rf[img_id]).unsqueeze(dim=1).repeat(1, n_levels, 1) # (Len_q, n_levels, 4)
+                    # convert ref from real image size to padded image size
+                    valid_ratio_per = valid_ratios[img_id]
+                    per_img_dec_ref_box = per_img_dec_ref_box * (torch.cat([valid_ratio_per, valid_ratio_per], -1))[None] # (Len_q, n_levels, 4) * (1, n_levels, 4)
+                    new_enc_refs.append( 
+                        fixed_encoder_reference_boxes[img_id].scatter(
+                        dim=0, 
+                        index=object_token_idx[:, None, None].repeat(1, n_levels, 4), # (num_object_token, n_levels, 4)
+                        src= per_img_dec_ref_box[valid_obj_query_idx]
+                        )
+                    )
+                else:
+                    new_enc_refs.append(fixed_encoder_reference_boxes[img_id])
+            new_enc_refs = torch.stack(new_enc_refs, dim=0) # (N, num_all_lvl_tokens, n_levels, 4)
+            encoder_reference_points = new_enc_refs.unsqueeze(3)
+
             
             # get the results of each stage
             dec_inter_states.append(decoder_query)
@@ -553,7 +601,7 @@ class DNDeformableDetrTransformer(nn.Module):
         **kwargs
     ):
 
-        memory = self.encoder.cascade_stage_encoder_part(
+        memory, _, _ = self.encoder.cascade_stage_encoder_part(
             layer_idx=stage_id,
             query=encoder_query,
             key=encoder_key,
@@ -612,7 +660,8 @@ class DNDeformableDetrTransformer(nn.Module):
             decoder_reference_points = reference_points
             decoder_query = target
         assert decoder_reference_points is not None
-        output, new_reference_points = self.decoder.cascade_stage_decoder_part(
+        output, new_reference_points, \
+            decoder_sampling_locations, decoder_attention_weights = self.decoder.cascade_stage_decoder_part(
             layer_idx=stage_id,
             query=decoder_query,
             key=memory,
@@ -628,4 +677,47 @@ class DNDeformableDetrTransformer(nn.Module):
             level_start_index=level_start_index,
             **kwargs
         )
-        return memory, output, new_reference_points, enc_outputs_class, enc_outputs_coord_unact, init_reference_out
+        return memory, output, new_reference_points, enc_outputs_class, enc_outputs_coord_unact, init_reference_out, \
+                decoder_sampling_locations, decoder_attention_weights
+
+def attn_map_to_flat_grid(spatial_shapes, level_start_index, sampling_locations, attention_weights):
+    # sampling_locations: [N, n_layers, Len_q, n_heads, n_levels, n_points, 2]
+    # attention_weights: [N, n_layers, Len_q, n_heads, n_levels, n_points]
+    N, n_layers, Len_q, n_heads, *_ = sampling_locations.shape
+    sampling_locations = sampling_locations.permute(0, 1, 3, 2, 5, 4, 6).flatten(0, 3)
+    # [N * n_layers * n_heads * Len_q, n_points, n_levels, 2]
+    attention_weights = attention_weights.permute(0, 1, 3, 2, 5, 4).flatten(0, 3)
+    # [N * n_layers * n_heads * Len_q, n_points, n_levels]
+
+    rev_spatial_shapes = torch.stack([spatial_shapes[..., 1], spatial_shapes[..., 0]], dim=-1) # hw -> wh (xy)
+    col_row_float = sampling_locations * rev_spatial_shapes # [N * n_layers * n_heads * Len_q, n_points, n_levels, 2]
+    # get 4 corner integeral positions around the floating-type sampling locations. 
+    col_row_ll = col_row_float.floor().to(torch.int64) # [N * n_layers * n_heads * Len_q, n_points, n_levels, 2]
+    zero = torch.zeros(*col_row_ll.shape[:-1], dtype=torch.int64, device=col_row_ll.device) # [N * n_layers * n_heads * Len_q, n_points, n_levels, 2]
+    one = torch.ones(*col_row_ll.shape[:-1], dtype=torch.int64, device=col_row_ll.device) # [N * n_layers * n_heads * Len_q, n_points, n_levels, 2]
+    col_row_lh = col_row_ll + torch.stack([zero, one], dim=-1)
+    col_row_hl = col_row_ll + torch.stack([one, zero], dim=-1)
+    col_row_hh = col_row_ll + 1
+    # compute magin for bilinear interpolation
+    margin_ll = (col_row_float - col_row_ll).prod(dim=-1)
+    margin_lh = -(col_row_float - col_row_lh).prod(dim=-1)
+    margin_hl = -(col_row_float - col_row_hl).prod(dim=-1)
+    margin_hh = (col_row_float - col_row_hh).prod(dim=-1) # [N * n_layers * n_heads * Len_q, n_points, n_levels, 2]
+
+    flat_grid_shape = (attention_weights.shape[0], int(torch.sum(spatial_shapes[..., 0] * spatial_shapes[..., 1]))) # [N * n_layers * n_heads * Len_q, num_all_lvl_tokens]
+    flat_grid = torch.zeros(flat_grid_shape, dtype=torch.float32, device=attention_weights.device) # [N * n_layers * n_heads * Len_q, num_all_lvl_tokens]
+
+    zipped = [(col_row_ll, margin_hh), (col_row_lh, margin_hl), (col_row_hl, margin_lh), (col_row_hh, margin_ll)]
+    for col_row, margin in zipped:
+        valid_mask = torch.logical_and(
+            torch.logical_and(col_row[..., 0] >= 0, col_row[..., 0] < rev_spatial_shapes[..., 0]),
+            torch.logical_and(col_row[..., 1] >= 0, col_row[..., 1] < rev_spatial_shapes[..., 1]),
+        )
+        #  [N * n_layers * n_heads * Len_q, n_points, n_levels] * [n_levels, ] + 
+        #  [N * n_layers * n_heads * Len_q, n_points, n_levels] + [n_levels]
+        idx = col_row[..., 1] * spatial_shapes[..., 1] + col_row[..., 0] + level_start_index
+        idx = (idx * valid_mask).flatten(1, 2)
+        weights = (attention_weights * valid_mask * margin).flatten(1)
+        flat_grid.scatter_add_(1, idx, weights)
+
+    return flat_grid.reshape(N, Len_q, n_layers, n_heads, -1).sum((2,3)).permute(0, 2, 1)

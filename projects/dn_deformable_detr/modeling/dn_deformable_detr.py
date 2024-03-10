@@ -234,12 +234,15 @@ class DNDeformableDETR(nn.Module):
         matching_label_query = matching_label_query.repeat(batch_size, 1, 1)
         matching_box_query = self.refpoint_embed.weight.repeat(batch_size, 1, 1)
 
+        self.transformer.num_matching_queries = matching_box_query.size(1)
+
         if targets is None:
             input_label_query = matching_label_query  # (num_queries, bs, embed_dim)
             input_box_query = matching_box_query  # (num_queries, bs, 4)
             attn_mask = None
             denoising_groups = self.denoising_groups
             max_gt_num_per_image = 0
+            self.transformer.num_noised_queries = 0
         else:
             # generate denoising queries and attention masks
             (
@@ -249,6 +252,7 @@ class DNDeformableDETR(nn.Module):
                 denoising_groups,
                 max_gt_num_per_image,
             ) = self.denoising_generator(gt_labels_list, gt_boxes_list)
+            self.transformer.num_noised_queries = noised_box_queries.size(1)
 
             # concate dn queries and matching queries as input
             input_label_query = torch.cat([noised_label_queries, matching_label_query], 1)
