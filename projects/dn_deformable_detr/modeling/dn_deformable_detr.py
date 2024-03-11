@@ -160,6 +160,8 @@ class DNDeformableDETR(nn.Module):
 
         # hack implementation for iterative bounding box refinement
         self.transformer.decoder.bbox_embed = self.bbox_embed
+        # ink added
+        self.transformer.decoder.class_embed = self.class_embed
 
         if self.as_two_stage:
             for bbox_embed_layer in self.bbox_embed:

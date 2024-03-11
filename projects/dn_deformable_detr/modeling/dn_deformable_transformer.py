@@ -514,6 +514,14 @@ class DNDeformableDetrTransformer(nn.Module):
             N, Len_q, n_heads, n_levels, n_points, _ = decoder_sampling_locations.size()
             sampling_locations = decoder_sampling_locations.clone().detach()[:, self.num_noised_queries:].unsqueeze(1) # adds layer dim
             attention_weights = decoder_attention_weights.clone().detach()[:, self.num_noised_queries:].unsqueeze(1)
+
+            decoder_matching_query_cls = self.decoder.class_embed[stage_id](decoder_matching_query).sigmoid().max(-1)[0].detach()
+            self.obj_thr = 0.2
+            # (N, num_matching_queries) -> (N, num_matching_queries, n_heads, n_levels, n_points)
+            # -> (N, 1, num_matching_queries, n_heads, n_levels, n_points)
+            dec_obj_mask = (decoder_matching_query_cls > self.obj_thr).view(N, self.num_matching_queries, 1, 1, 1).repeat(1, 1, n_heads, n_levels, n_points)
+            dec_obj_mask = dec_obj_mask[:, None]
+            attention_weights = attention_weights.masked_fill(~dec_obj_mask, 0) # empty the weights of non-object queries
             
             # (bs, num_all_lvl_tokens, num_matching_queries)
             decoder_cross_attention_map =attn_map_to_flat_grid(spatial_shapes, level_start_index, sampling_locations, attention_weights)
@@ -541,7 +549,7 @@ class DNDeformableDetrTransformer(nn.Module):
                         fixed_encoder_reference_boxes[img_id].scatter(
                         dim=0, 
                         index=object_token_idx[:, None, None].repeat(1, n_levels, 4), # (num_object_token, n_levels, 4)
-                        src= per_img_dec_ref_box[valid_obj_query_idx]
+                        src=per_img_dec_ref_box[valid_obj_query_idx]
                         )
                     )
                 else:
