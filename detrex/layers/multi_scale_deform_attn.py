@@ -292,10 +292,18 @@ class MultiScaleDeformableAttention(nn.Module):
             value = value.masked_fill(key_padding_mask[..., None], float(0))
         # [bs, all hw, 256] -> [bs, all hw, 8, 32]
         value = value.view(bs, num_value, self.num_heads, -1)
-        # [bs, all hw, 8, 4, 4, 2]: 8 heads, 4 level features, 4 sampling points, 2 offsets
-        sampling_offsets = self.sampling_offsets(query).view(
-            bs, num_query, self.num_heads, self.num_levels, self.num_points, 2
-        )
+        
+        # Ink:v1.2
+        encoder_reference_queries = kwargs.get("reference_queries", None)
+        if encoder_reference_queries is not None:
+            sampling_offsets = self.sampling_offsets(encoder_reference_queries).view(
+                bs, num_query, self.num_heads, self.num_levels, self.num_points, 2
+            )
+        else:
+            # [bs, all hw, 8, 4, 4, 2]: 8 heads, 4 level features, 4 sampling points, 2 offsets
+            sampling_offsets = self.sampling_offsets(query).view(
+                bs, num_query, self.num_heads, self.num_levels, self.num_points, 2
+            )
         # [bs, all hw, 8, 16]: 4 level 4 sampling points: 16 features total
         attention_weights = self.attention_weights(query).view(
             bs, num_query, self.num_heads, self.num_levels * self.num_points
