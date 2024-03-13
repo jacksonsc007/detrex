@@ -21,7 +21,15 @@ For the encoder in the original works, both sampling offsets and attention weigh
 #### 1.2.0.1
 retain the gradient of object queries when generating the sampling offsets for encoder.
 
-- TODO
+
+> #TODO
 2. The generation of attention weight comes in two ways:
 - naive scaled dot-product between feature of tokens and sampling points.
 - object queries decide the attention weights for each sampling points.
+
+
+3. restrain the sampling points within the range of predicted boxes?
+
+
+### 1.2.1
+we use scaled dot-product between token feature and sampling feature to generate attention weight in encoder. Code implementation is unperfect. 

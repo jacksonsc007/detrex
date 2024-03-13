@@ -124,7 +124,7 @@ def multi_scale_deformable_attn_pytorch(
         sampling_value_list.append(sampling_value_l_)
     # (bs, num_queries, num_heads, num_levels, num_points) ->
     # (bs, num_heads, num_queries, num_levels, num_points) ->
-    # (bs, num_heads, 1, num_queries, num_levels*num_points)
+    # (bs * num_heads, 1, num_queries, num_levels*num_points)
     attention_weights = attention_weights.transpose(1, 2).reshape(
         bs * num_heads, 1, num_queries, num_levels * num_points
     )
@@ -135,6 +135,53 @@ def multi_scale_deformable_attn_pytorch(
     )
     return output.transpose(1, 2).contiguous()
 
+def generate_naive_attention_weight(
+    query: torch.Tensor,
+    value: torch.Tensor,
+    value_spatial_shapes: torch.Tensor,
+    sampling_locations: torch.Tensor,
+) -> torch.Tensor:
+    '''
+    Hack implementation of scale dot-product attention. 
+    Sampling values are re-calculated in the <MultiScaleDeformableAttnFunction> cuda operand. So there are redundant calculations.
+    '''
+    bs, _, num_heads, embed_dims = value.shape
+    _, num_queries, num_heads, num_levels, num_points, _ = sampling_locations.shape
+    value_list = value.split([H_ * W_ for H_, W_ in value_spatial_shapes], dim=1)
+    sampling_grids = 2 * sampling_locations - 1
+    sampling_value_all_lvl = []
+    for level, (H_, W_) in enumerate(value_spatial_shapes):
+        # bs, H_*W_, num_heads, embed_dims ->
+        # bs, H_*W_, num_heads*embed_dims ->
+        # bs, num_heads*embed_dims, H_*W_ ->
+        # bs*num_heads, embed_dims, H_, W_
+        value_l_ = (
+            value_list[level].flatten(2).transpose(1, 2).reshape(bs * num_heads, embed_dims, H_, W_)
+        )
+        # bs, num_queries, num_heads, num_points, 2 ->
+        # bs, num_heads, num_queries, num_points, 2 ->
+        # bs*num_heads, num_queries, num_points, 2
+        sampling_grid_l_ = sampling_grids[:, :, :, level].transpose(1, 2).flatten(0, 1)
+        # bs*num_heads, embed_dims, num_queries, num_points
+        sampling_value_l_ = F.grid_sample(
+            value_l_, sampling_grid_l_, mode="bilinear", padding_mode="zeros", align_corners=False
+        )
+        sampling_value_all_lvl.append(sampling_value_l_)
+    # bs * num_heads, embed_dims, num_queries, num_level, num_points ->
+    # bs * num_heads, num_queries, num_levels, num_points, embed_dims ->
+    # bs * num_heads * num_queries, num_levels * num_points, embed_dims -> 
+    sampling_values = torch.stack(sampling_value_all_lvl, dim=-2).permute(0, 2, 3, 4, 1).flatten(0, 1).flatten(1, 2) 
+    scaling = float(embed_dims) ** -0.5
+    # bs, num_queries, feat_dim ->
+    # bs, num_queries, num_heads, embed_dim ->
+    # bs * num_queries * num_heads, embed_dim ->
+    # bs * num_queries * num_heads, 1, embed_dim ->
+    query = query.reshape(bs, num_queries, num_heads, embed_dims).flatten(0, 2).unsqueeze(1) * scaling
+    attention_weight = torch.bmm(query, sampling_values.transpose(1, 2)).squeeze(-2) # bs * num_queries * num_heads, num_levels * num_points
+    attention_weight = attention_weight.softmax(-1)
+
+    attention_weight = attention_weight.reshape(bs, num_queries, num_heads, num_levels, num_points)
+    return attention_weight
 
 class MultiScaleDeformableAttention(nn.Module):
     """Multi-Scale Deformable Attention Module used in Deformable-DETR
@@ -304,19 +351,6 @@ class MultiScaleDeformableAttention(nn.Module):
             sampling_offsets = self.sampling_offsets(query).view(
                 bs, num_query, self.num_heads, self.num_levels, self.num_points, 2
             )
-        # [bs, all hw, 8, 16]: 4 level 4 sampling points: 16 features total
-        attention_weights = self.attention_weights(query).view(
-            bs, num_query, self.num_heads, self.num_levels * self.num_points
-        )
-        attention_weights = attention_weights.softmax(-1)
-        attention_weights = attention_weights.view(
-            bs,
-            num_query,
-            self.num_heads,
-            self.num_levels,
-            self.num_points,
-        )
-
         # Ink added
         N, Len_q, n_heads, n_levels, n_points, _ = sampling_offsets.size()
         if reference_points.ndim == 4:
@@ -353,6 +387,24 @@ class MultiScaleDeformableAttention(nn.Module):
                     reference_points.shape[-1]
                 )
             )
+        
+        if encoder_reference_queries is not None:
+            # generate attention weight by scaled dot-product
+            attention_weights = generate_naive_attention_weight(query, value, spatial_shapes, sampling_locations)
+        else:
+            # [bs, all hw, 8, 16]: 4 level 4 sampling points: 16 features total
+            attention_weights = self.attention_weights(query).view(
+                bs, num_query, self.num_heads, self.num_levels * self.num_points
+            )
+            attention_weights = attention_weights.softmax(-1)
+            attention_weights = attention_weights.view(
+                bs,
+                num_query,
+                self.num_heads,
+                self.num_levels,
+                self.num_points,
+            )
+
         
         # the original impl for fp32 training
         if torch.cuda.is_available() and value.is_cuda:
