@@ -513,7 +513,8 @@ class DNDeformableDetrTransformer(nn.Module):
             )
 
             bs, n_all_q, feat_c = decoder_query.size()
-            decoder_matching_query = decoder_query.clone().detach()[:, self.num_noised_queries:]
+            # decoder_matching_query = decoder_query.clone().detach()[:, self.num_noised_queries:]
+            decoder_matching_query = decoder_query[:, self.num_noised_queries:]
             decoder_matching_query_rf = decoder_reference_points.clone().detach()[:, self.num_noised_queries:]
             N, Len_q, n_heads, n_levels, n_points, _ = decoder_sampling_locations.size()
             sampling_locations = decoder_sampling_locations.clone().detach()[:, self.num_noised_queries:].unsqueeze(1) # adds layer dim
