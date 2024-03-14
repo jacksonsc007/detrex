@@ -191,7 +191,7 @@ class MultiScaleDeformableAttention(nn.Module):
         self.num_points = num_points
         # n_heads * n_points and n_levels for multi-level feature inputs
         self.sampling_offsets = nn.Linear(embed_dim, num_heads  * num_points * 2)
-        self.attention_weights = nn.Linear(embed_dim, num_heads * num_levels * num_points)
+        self.attention_weights = nn.Linear(embed_dim,  num_levels)
         self.value_proj = nn.Linear(embed_dim, embed_dim)
         self.output_proj = nn.Linear(embed_dim, embed_dim)
 
@@ -298,16 +298,16 @@ class MultiScaleDeformableAttention(nn.Module):
         ).repeat(1, 1, 1, self.num_levels, 1, 1)
         # [bs, all hw, 8, 16]: 4 level 4 sampling points: 16 features total
         attention_weights = self.attention_weights(query).view(
-            bs, num_query, self.num_heads, self.num_levels * self.num_points
+            bs, num_query, self.num_levels
         )
         attention_weights = attention_weights.softmax(-1)
         attention_weights = attention_weights.view(
             bs,
             num_query,
-            self.num_heads,
+            1,
             self.num_levels,
-            self.num_points,
-        )
+            1,
+        ).repeat(1, 1, self.num_heads, 1, self.num_points)
 
         # bs, num_query, num_heads, num_levels, num_points, 2
         if reference_points.shape[-1] == 2:
