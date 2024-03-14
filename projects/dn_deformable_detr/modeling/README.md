@@ -8,3 +8,10 @@
 ## minor version 1.1
 based on v1.0, we add:
 1. only matching queries with cls > 0.2 contribute to the cross-attention map.
+
+
+# major version 2
+branch name: multiDA
+## v2.0.0
+In this version, we would like to validate the following idea:
+Let object tokens explicitly focus multi objects.

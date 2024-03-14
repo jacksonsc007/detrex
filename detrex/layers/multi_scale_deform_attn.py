@@ -160,6 +160,7 @@ class MultiScaleDeformableAttention(nn.Module):
         num_heads: int = 8,
         num_levels: int = 4,
         num_points: int = 4,
+        num_objects: int = 2,
         img2col_step: int = 64,
         dropout: float = 0.1,
         batch_first: bool = False,
@@ -189,9 +190,10 @@ class MultiScaleDeformableAttention(nn.Module):
         self.num_heads = num_heads
         self.num_levels = num_levels
         self.num_points = num_points
+        self.num_objects = num_objects
         # n_heads * n_points and n_levels for multi-level feature inputs
-        self.sampling_offsets = nn.Linear(embed_dim, num_heads * num_levels * num_points * 2)
-        self.attention_weights = nn.Linear(embed_dim, num_heads * num_levels * num_points)
+        self.sampling_offsets = nn.Linear(embed_dim, num_heads * num_levels * num_objects * num_points * 2)
+        self.attention_weights = nn.Linear(embed_dim, num_heads * num_levels * num_objects * num_points)
         self.value_proj = nn.Linear(embed_dim, embed_dim)
         self.output_proj = nn.Linear(embed_dim, embed_dim)
 
@@ -208,11 +210,11 @@ class MultiScaleDeformableAttention(nn.Module):
         grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
         grid_init = (
             (grid_init / grid_init.abs().max(-1, keepdim=True)[0])
-            .view(self.num_heads, 1, 1, 2)
-            .repeat(1, self.num_levels, self.num_points, 1)
+            .view(self.num_heads, 1, 1, 1, 2)
+            .repeat(1, self.num_levels, self.num_objects, self.num_points, 1)
         )
         for i in range(self.num_points):
-            grid_init[:, :, i, :] *= i + 1
+            grid_init[:, :, :, i, :] *= i + 1
         with torch.no_grad():
             self.sampling_offsets.bias = nn.Parameter(grid_init.view(-1))
         constant_(self.attention_weights.weight.data, 0.0)
@@ -292,13 +294,13 @@ class MultiScaleDeformableAttention(nn.Module):
             value = value.masked_fill(key_padding_mask[..., None], float(0))
         # [bs, all hw, 256] -> [bs, all hw, 8, 32]
         value = value.view(bs, num_value, self.num_heads, -1)
-        # [bs, all hw, 8, 4, 4, 2]: 8 heads, 4 level features, 4 sampling points, 2 offsets
+        # (bs, num_queries, num_heads, num_levels, num_objects, num_points, 2) ->
+        # (bs, num_queries, num_heads, num_levels, num_objects * num_points, 2) ->
         sampling_offsets = self.sampling_offsets(query).view(
-            bs, num_query, self.num_heads, self.num_levels, self.num_points, 2
+            bs, num_query, self.num_heads, self.num_levels, self. num_objects, self.num_points, 2
         )
-        # [bs, all hw, 8, 16]: 4 level 4 sampling points: 16 features total
         attention_weights = self.attention_weights(query).view(
-            bs, num_query, self.num_heads, self.num_levels * self.num_points
+            bs, num_query, self.num_heads, self.num_levels * self.num_objects, self.num_points
         )
         attention_weights = attention_weights.softmax(-1)
         attention_weights = attention_weights.view(
@@ -306,32 +308,37 @@ class MultiScaleDeformableAttention(nn.Module):
             num_query,
             self.num_heads,
             self.num_levels,
+            self.num_objects,
             self.num_points,
-        )
+        ).flatten(4, 5)
 
         # Ink added
-        N, Len_q, n_heads, n_levels, n_points, _ = sampling_offsets.size()
+        N, Len_q, n_heads, n_levels, n_objs, n_points, _ = sampling_offsets.size()
         if reference_points.ndim == 4:
-            # dim 4 represents the original design
-            reference_points = reference_points[:, :, None, :, None, :]
+            # dim 4 represents the original design 
+            # (N, len_q, num_levels, 4) ->
+            # (N, len_q, 1, num_levels, 1, 1, 4) 
+            reference_points = reference_points[:, :, None, :, None, None, :] # add heads, objects, points dimension
         else:
-            assert reference_points.size() == torch.Size([N, Len_q, n_levels, 1, 4]) 
+            assert reference_points.size() == torch.Size([N, Len_q, n_levels, n_objs, 1, 4]) 
             reference_points = reference_points[:, :, None] # add heads dimension
 
         # bs, num_query, num_heads, num_levels, num_points, 2
         if reference_points.shape[-1] == 2:
             
-            # reference_points   [bs, all hw, 4, 2] -> [bs, all hw, 1, 4, 1, 2]
-            # sampling_offsets   [bs, all hw, 8, 4, 4, 2]
-            # offset_normalizer  [4, 2] -> [1, 1, 1, 4, 1, 2]
+            # reference_points   (N, len_q,         1, num_levels,           1,          1, 2) 
+            # sampling_offsets   (N, len_q, num_heads, num_levels, num_objects, num_points, 2)
+            # offset_normalizer  (1,     1,         1,          4,           1,          1, 2) 
             # references_points + sampling_offsets
             
             offset_normalizer = torch.stack([spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
             sampling_locations = (
                 reference_points
-                + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
+                + sampling_offsets / offset_normalizer[None, None, None, :, None, None, :]
             )
         elif reference_points.shape[-1] == 4:
+            # reference_points   (N, len_q,         1, num_levels, num_objects,          1, 4) 
+            # sampling_offsets   (N, len_q, num_heads, num_levels, num_objects, num_points, 2)
             sampling_locations = (
                 reference_points[..., :2]
                 + sampling_offsets
@@ -345,7 +352,11 @@ class MultiScaleDeformableAttention(nn.Module):
                     reference_points.shape[-1]
                 )
             )
-        
+        # merge obj and point dimensions
+        # (N, len_q, num_heads, num_levels, num_objects, num_points, 2) ->
+        # (N, len_q, num_heads, num_levels, num_objects * num_points, 2)
+        sampling_locations =sampling_locations.flatten(4, 5)
+
         # the original impl for fp32 training
         if torch.cuda.is_available() and value.is_cuda:
             output = MultiScaleDeformableAttnFunction.apply(

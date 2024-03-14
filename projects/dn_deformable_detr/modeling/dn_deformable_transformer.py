@@ -471,6 +471,12 @@ class DNDeformableDetrTransformer(nn.Module):
         memory = feat_flatten
         encoder_reference_points = fixed_encoder_reference_boxes
 
+        # v2.0
+        num_focus_objects = 2
+        # (N, num_all_lvl_tokens, n_levels, 4) ->
+        # (N, num_all_lvl_tokens, n_levels, num_focus_objects, 4)
+        fixed_encoder_reference_boxes = fixed_encoder_reference_boxes[..., None, :].repeat(1, 1, 1, num_focus_objects, 1)
+
         dec_inter_states = []
         dec_inter_references = []
         enc_inter_outputs_class = []
@@ -526,36 +532,48 @@ class DNDeformableDetrTransformer(nn.Module):
             # (bs, num_all_lvl_tokens, num_matching_queries)
             decoder_cross_attention_map =attn_map_to_flat_grid(spatial_shapes, level_start_index, sampling_locations, attention_weights)
 
-            max_attn_weight, max_query_idx = decoder_cross_attention_map.max(dim=2)
-            # max_attn_weight2, max_query_idx2 = decoder_cross_attention_map[:, :, :self.num_queries_one2one].max(dim=2)
+            topk_attn_weight, topk_query_idx = decoder_cross_attention_map.topk(num_focus_objects, dim=2)
             new_enc_refs = []
             self.attn_weight_thr = 0.1
             for img_id in range(N):
-                object_token_idx = (max_attn_weight[img_id] > self.attn_weight_thr).nonzero().squeeze(1)
-                # object_token_idx2 = (max_attn_weight2[img_id] > 0).nonzero().squeeze(1)
+                # both topk weight are larger than threshold
+                object_token_idx = (topk_attn_weight[img_id][..., 1] > self.attn_weight_thr).nonzero().squeeze(1)
 
                 # valid_ratio1 = len(object_token_idx) / num_tokens_all_lvl
                 # valid_ratio2 = len(object_token_idx2) / num_tokens_all_lvl
                     
                 if len(object_token_idx) !=0:
-                    valid_obj_query_idx = (max_query_idx[img_id])[object_token_idx]
-                    # encoder_reference_boxes[0]: (num_all_lvl_tokens, num_levels, 4)
-                    # decoder_reference_points: (N, Len_q, 4)
-                    per_img_dec_ref_box = (decoder_matching_query_rf[img_id]).unsqueeze(dim=1).repeat(1, n_levels, 1) # (Len_q, n_levels, 4)
+                    # (num_matching_queries, 4) ->
+                    # (num_matching_queries, 1, 4) ->
+                    # (num_matching_queries, num_focus_objects, 4) ->
+                    per_img_dec_ref_box = (decoder_matching_query_rf[img_id])[:, None, :].repeat(1, num_focus_objects, 1) # (Len_q, num_focus_objects, n_levels, 4)
+                    # (num_obj_tokens, num_focus_objects) ->
+                    # (num_obj_tokens, num_focus_objects, 1) ->
+                    # (num_obj_tokens, num_focus_objects, 4) ->
+                    obj_query_idx_per = ( (topk_query_idx[img_id])[object_token_idx] )[:, :, None].repeat(1, 1, 4) # (num_obj_token, num_focus_objects, n_levels, 4)
+                    # (num_obj_tokens, num_focus_objects, 4)
+                    obj_query_ref_box_per = per_img_dec_ref_box.gather(
+                        dim=0,
+                        index=obj_query_idx_per
+                    )
                     # convert ref from real image size to padded image size
-                    valid_ratio_per = valid_ratios[img_id]
-                    per_img_dec_ref_box = per_img_dec_ref_box * (torch.cat([valid_ratio_per, valid_ratio_per], -1))[None] # (Len_q, n_levels, 4) * (1, n_levels, 4)
+                    valid_ratio_per = valid_ratios[img_id] # (n_levels, 2)
+                    # (num_obj_tokens,        1, num_focus_objects, 4) *
+                    # (             1, n_levels,                 1, 4) ->
+                    # (num_obj_tokens, n_levels, num_focus_objects, 4)
+                    obj_query_ref_box_per = obj_query_ref_box_per[:, None] * (torch.cat([valid_ratio_per, valid_ratio_per], -1))[None, :, None]
                     new_enc_refs.append( 
-                        fixed_encoder_reference_boxes[img_id].scatter(
+                        fixed_encoder_reference_boxes[img_id].scatter( # (num_all_lvl_tokens, n_levels, num_focus_objects, 4)
                         dim=0, 
-                        index=object_token_idx[:, None, None].repeat(1, n_levels, 4), # (num_object_token, n_levels, 4)
-                        src=per_img_dec_ref_box[valid_obj_query_idx]
+                        index=object_token_idx[:, None, None, None].repeat(1, n_levels, num_focus_objects, 4),
+                        src=obj_query_ref_box_per
                         )
                     )
                 else:
                     new_enc_refs.append(fixed_encoder_reference_boxes[img_id])
-            new_enc_refs = torch.stack(new_enc_refs, dim=0) # (N, num_all_lvl_tokens, n_levels, 4)
-            encoder_reference_points = new_enc_refs.unsqueeze(3)
+            new_enc_refs = torch.stack(new_enc_refs, dim=0) # (N, num_all_lvl_tokens, n_levels, num_focus_objects, 4)
+            # (N, num_all_lvl_tokens, n_levels, num_focus_objects, 1, 4)
+            encoder_reference_points = new_enc_refs.unsqueeze(-2)
 
             
             # get the results of each stage
