@@ -295,12 +295,11 @@ class MultiScaleDeformableAttention(nn.Module):
         # [bs, all hw, 256] -> [bs, all hw, 8, 32]
         value = value.view(bs, num_value, self.num_heads, -1)
         # (bs, num_queries, num_heads, num_levels, num_objects, num_points, 2) ->
-        # (bs, num_queries, num_heads, num_levels, num_objects * num_points, 2) ->
         sampling_offsets = self.sampling_offsets(query).view(
             bs, num_query, self.num_heads, self.num_levels, self. num_objects, self.num_points, 2
         )
         attention_weights = self.attention_weights(query).view(
-            bs, num_query, self.num_heads, self.num_levels * self.num_objects, self.num_points
+            bs, num_query, self.num_heads, self.num_levels * self.num_objects * self.num_points
         )
         attention_weights = attention_weights.softmax(-1)
         attention_weights = attention_weights.view(
