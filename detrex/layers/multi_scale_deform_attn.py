@@ -202,19 +202,20 @@ class MultiScaleDeformableAttention(nn.Module):
         Default initialization for Parameters of Module.
         """
         constant_(self.sampling_offsets.weight.data, 0.0)
-        thetas = torch.arange(self.num_heads, dtype=torch.float32) * (
-            2.0 * math.pi / self.num_heads
-        )
-        grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
-        grid_init = (
-            (grid_init / grid_init.abs().max(-1, keepdim=True)[0])
-            .view(self.num_heads, 1, 1, 2)
-            .repeat(1, self.num_levels, self.num_points, 1)
-        )
-        for i in range(self.num_points):
-            grid_init[:, :, i, :] *= i + 1
-        with torch.no_grad():
-            self.sampling_offsets.bias = nn.Parameter(grid_init.view(-1))
+        # thetas = torch.arange(self.num_heads, dtype=torch.float32) * (
+        #     2.0 * math.pi / self.num_heads
+        # )
+        # grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
+        # grid_init = (
+        #     (grid_init / grid_init.abs().max(-1, keepdim=True)[0])
+        #     .view(self.num_heads, 1, 1, 2)
+        #     .repeat(1, self.num_levels, self.num_points, 1)
+        # )
+        # for i in range(self.num_points):
+        #     grid_init[:, :, i, :] *= i + 1
+        # with torch.no_grad():
+        #     self.sampling_offsets.bias = nn.Parameter(grid_init.view(-1))
+        constant_(self.sampling_offsets.bias.data, 0.0)
         constant_(self.attention_weights.weight.data, 0.0)
         constant_(self.attention_weights.bias.data, 0.0)
         xavier_uniform_(self.value_proj.weight.data)
