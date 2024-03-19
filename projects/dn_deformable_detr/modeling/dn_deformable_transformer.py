@@ -390,10 +390,12 @@ class DNDeformableDetrTransformer(nn.Module):
             )
             ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H)
             ref_x = ref_x.reshape(-1)[None] / (valid_ratios[:, None, lvl, 0] * W)
-            ref = torch.stack((ref_x, ref_y), -1)
+            ref_w = torch.ones_like(ref_x) * 0.05 * (2.0**lvl)
+            ref_h = ref_w.clone()
+            ref = torch.stack((ref_x, ref_y, ref_w, ref_h), -1) # (bs, num, 4)
             reference_points_list.append(ref)
-        reference_points = torch.cat(reference_points_list, 1)
-        reference_points = reference_points[:, :, None] * valid_ratios[:, None]
+        reference_points = torch.cat(reference_points_list, 1) # (bs, num_all_lvl, 4)
+        reference_points = reference_points[:, :, None] * valid_ratios[:, None].repeat(1, 1, 1, 2)
         return reference_points
 
     def get_valid_ratio(self, mask):
