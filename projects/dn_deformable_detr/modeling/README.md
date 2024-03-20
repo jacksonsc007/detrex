@@ -18,3 +18,7 @@ on the basisi on  v1.2, we limit the sampling points are within the range of box
 1. we increase the number of sampling points.
 2. fix tanh bug and use sigmoid
 3. change softmax range from object level to head level.
+
+
+# v1.3.2
+1. we modify the initialization of bias of the sampling_offset of multi_scale_deformable_attention.

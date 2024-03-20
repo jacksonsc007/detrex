@@ -33,6 +33,7 @@ from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 from torch.nn.init import constant_, xavier_uniform_
 from .mlp import MLP
+from detrex.utils import inverse_sigmoid
 
 
 # helpers
@@ -160,7 +161,7 @@ class MultiScaleDeformableAttention(nn.Module):
         embed_dim: int = 256,
         num_heads: int = 8,
         num_levels: int = 4,
-        num_points: int = 4,
+        num_points: int = 16,
         img2col_step: int = 64,
         dropout: float = 0.1,
         batch_first: bool = False,
@@ -204,7 +205,6 @@ class MultiScaleDeformableAttention(nn.Module):
         """
         Default initialization for Parameters of Module.
         """
-        constant_(self.sampling_offsets.layers[-1].weight.data, 0.0)
         # thetas = torch.arange(self.num_heads, dtype=torch.float32) * (
         #     2.0 * math.pi / self.num_heads
         # )
@@ -218,7 +218,22 @@ class MultiScaleDeformableAttention(nn.Module):
         #     grid_init[:, :, i, :] *= i + 1
         # with torch.no_grad():
         #     self.sampling_offsets.bias = nn.Parameter(grid_init.view(-1))
-        constant_(self.sampling_offsets.layers[-1].bias.data, 0.0)
+
+        # https://github1s.com/MCG-NJU/AdaMixer/blob/main/mmdet/models/roi_heads/bbox_heads/adamixer_decoder_stage.py#L113-L121
+        assert int(self.num_points ** 0.5) ** 2 == self.num_points
+        len_square = int(self.num_points ** 0.5)
+        y = torch.linspace(0, 1, len_square + 2)
+        yp = y[1:-1]
+        y = yp.view(-1, 1).repeat(1, len_square)
+        x = yp.view(1, -1).repeat(len_square, 1)
+        y = y.flatten(0, 1)[:, None]
+        x = x.flatten(0, 1)[:, None]
+        grid_init = torch.cat([y, x], dim=-1) # (num_points, 2)
+        grid_init = grid_init[None].repeat(self.num_heads, 1, 1)# (num_heads, num_points, 2)
+        grid_init = inverse_sigmoid(grid_init)
+        with torch.no_grad():
+            self.sampling_offsets.layers[-1].bias = nn.Parameter(grid_init.view(-1))
+        constant_(self.sampling_offsets.layers[-1].weight.data, 0.0)
         constant_(self.attention_weights.weight.data, 0.0)
         constant_(self.attention_weights.bias.data, 0.0)
         xavier_uniform_(self.value_proj.weight.data)
