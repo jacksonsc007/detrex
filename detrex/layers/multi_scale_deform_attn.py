@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 from torch.nn.init import constant_, xavier_uniform_
+from .mlp import MLP
 
 
 # helpers
@@ -159,7 +160,7 @@ class MultiScaleDeformableAttention(nn.Module):
         embed_dim: int = 256,
         num_heads: int = 8,
         num_levels: int = 4,
-        num_points: int = 4,
+        num_points: int = 1,
         img2col_step: int = 64,
         dropout: float = 0.1,
         batch_first: bool = False,
@@ -189,8 +190,10 @@ class MultiScaleDeformableAttention(nn.Module):
         self.num_heads = num_heads
         self.num_levels = num_levels
         self.num_points = num_points
+        assert self.num_points == 1, "num_points must be 1 for compatibility concern"
         # n_heads * n_points and n_levels for multi-level feature inputs
-        self.sampling_offsets = nn.Linear(embed_dim, num_heads * num_levels * num_points * 2)
+        # self.sampling_offsets = nn.Linear(embed_dim, num_heads * num_levels * num_points * 2)
+        self.sampling_offsets = MLP(embed_dim, embed_dim, num_heads * 2, 3)
         self.attention_weights = nn.Linear(embed_dim, num_heads * num_levels * num_points)
         self.value_proj = nn.Linear(embed_dim, embed_dim)
         self.output_proj = nn.Linear(embed_dim, embed_dim)
@@ -201,21 +204,21 @@ class MultiScaleDeformableAttention(nn.Module):
         """
         Default initialization for Parameters of Module.
         """
-        constant_(self.sampling_offsets.weight.data, 0.0)
-        thetas = torch.arange(self.num_heads, dtype=torch.float32) * (
-            2.0 * math.pi / self.num_heads
-        )
-        grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
-        grid_init = (
-            (grid_init / grid_init.abs().max(-1, keepdim=True)[0])
-            .view(self.num_heads, 1, 1, 2)
-            .repeat(1, self.num_levels, self.num_points, 1)
-        )
-        for i in range(self.num_points):
-            grid_init[:, :, i, :] *= i + 1
-        with torch.no_grad():
-            self.sampling_offsets.bias = nn.Parameter(grid_init.view(-1))
-        # constant_(self.sampling_offsets.bias.data, 0.0)
+        constant_(self.sampling_offsets.layers[-1].weight.data, 0.0)
+        # thetas = torch.arange(self.num_heads, dtype=torch.float32) * (
+        #     2.0 * math.pi / self.num_heads
+        # )
+        # grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
+        # grid_init = (
+        #     (grid_init / grid_init.abs().max(-1, keepdim=True)[0])
+        #     .view(self.num_heads, 1, 1, 2)
+        #     .repeat(1, self.num_levels, self.num_points, 1)
+        # )
+        # for i in range(self.num_points):
+        #     grid_init[:, :, i, :] *= i + 1
+        # with torch.no_grad():
+        #     self.sampling_offsets.bias = nn.Parameter(grid_init.view(-1))
+        constant_(self.sampling_offsets.layers[-1].bias.data, 0.0)
         constant_(self.attention_weights.weight.data, 0.0)
         constant_(self.attention_weights.bias.data, 0.0)
         xavier_uniform_(self.value_proj.weight.data)
@@ -293,13 +296,16 @@ class MultiScaleDeformableAttention(nn.Module):
             value = value.masked_fill(key_padding_mask[..., None], float(0))
         # [bs, all hw, 256] -> [bs, all hw, 8, 32]
         value = value.view(bs, num_value, self.num_heads, -1)
-        # [bs, all hw, 8, 4, 4, 2]: 8 heads, 4 level features, 4 sampling points, 2 offsets
+        # (N, num_q, num_heads, 1, 1, 2)
         sampling_offsets = self.sampling_offsets(query).view(
-            bs, num_query, self.num_heads, self.num_levels, self.num_points, 2
-        )
+            bs, num_query, self.num_heads, 1 , 1, 2
+        ).tanh()
+        sampling_offsets = sampling_offsets.repeat(1, 1, 1, self.num_levels, self.num_points, 1)
+
+
         # [bs, all hw, 8, 16]: 4 level 4 sampling points: 16 features total
         attention_weights = self.attention_weights(query).view(
-            bs, num_query, self.num_heads, self.num_levels * self.num_points
+            bs, num_query, self.num_heads * self.num_levels * self.num_points
         )
         attention_weights = attention_weights.softmax(-1)
         attention_weights = attention_weights.view(
@@ -312,7 +318,7 @@ class MultiScaleDeformableAttention(nn.Module):
 
         # bs, num_query, num_heads, num_levels, num_points, 2
         if reference_points.shape[-1] == 2:
-            
+            raise ValueError("Only reference boxes are accepted.")
             # reference_points   [bs, all hw, 4, 2] -> [bs, all hw, 1, 4, 1, 2]
             # sampling_offsets   [bs, all hw, 8, 4, 4, 2]
             # offset_normalizer  [4, 2] -> [1, 1, 1, 4, 1, 2]
@@ -324,12 +330,25 @@ class MultiScaleDeformableAttention(nn.Module):
                 + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
             )
         elif reference_points.shape[-1] == 4:
+            # sampling_locations = (
+            #     reference_points[:, :, None, :, None, :2]
+            #     + sampling_offsets
+            #     / self.num_points
+            #     * reference_points[:, :, None, :, None, 2:]
+            #     * 0.5
+            # )
+            '''
+            Generate sampling points inside boxes.
+            x_l < c_x + w * 0.5 * alpha < x_r,
+            y_l < c_y + h * 0.5 * alpha < y_r,
+            -1 < alpha < 1,  
+
+            reference_points: (N, num_q, num_level, 4) -> (N, num_q, 1, num_level, 1, 4)
+            sampling_offsets: (N, num_q, num_heads, num_level, num_points, 2)
+            '''
             sampling_locations = (
-                reference_points[:, :, None, :, None, :2]
-                + sampling_offsets
-                / self.num_points
-                * reference_points[:, :, None, :, None, 2:]
-                * 0.5
+                reference_points[:, :, None, :, None, :2] + 
+                sampling_offsets * reference_points[:, :, None, :, None, 2:] * 0.5
             )
         else:
             raise ValueError(
