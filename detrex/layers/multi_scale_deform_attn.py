@@ -160,7 +160,7 @@ class MultiScaleDeformableAttention(nn.Module):
         embed_dim: int = 256,
         num_heads: int = 8,
         num_levels: int = 4,
-        num_points: int = 1,
+        num_points: int = 4,
         img2col_step: int = 64,
         dropout: float = 0.1,
         batch_first: bool = False,
@@ -190,10 +190,10 @@ class MultiScaleDeformableAttention(nn.Module):
         self.num_heads = num_heads
         self.num_levels = num_levels
         self.num_points = num_points
-        assert self.num_points == 1, "num_points must be 1 for compatibility concern"
+        # assert self.num_points == 1, "num_points must be 1 for compatibility concern"
         # n_heads * n_points and n_levels for multi-level feature inputs
         # self.sampling_offsets = nn.Linear(embed_dim, num_heads * num_levels * num_points * 2)
-        self.sampling_offsets = MLP(embed_dim, embed_dim, num_heads * 2, 3)
+        self.sampling_offsets = MLP(embed_dim, embed_dim, num_heads * num_points * 2, 3)
         self.attention_weights = nn.Linear(embed_dim, num_heads * num_levels * num_points)
         self.value_proj = nn.Linear(embed_dim, embed_dim)
         self.output_proj = nn.Linear(embed_dim, embed_dim)
@@ -298,14 +298,16 @@ class MultiScaleDeformableAttention(nn.Module):
         value = value.view(bs, num_value, self.num_heads, -1)
         # (N, num_q, num_heads, 1, 1, 2)
         sampling_offsets = self.sampling_offsets(query).view(
-            bs, num_query, self.num_heads, 1 , 1, 2
-        ).tanh()
-        sampling_offsets = sampling_offsets.repeat(1, 1, 1, self.num_levels, self.num_points, 1)
+            bs, num_query, self.num_heads, 1 , self.num_points, 2
+        ).sigmoid()
+        # (0, 1) -> (-1, 1)
+        sampling_offsets = 2 * sampling_offsets -1
+        sampling_offsets = sampling_offsets.repeat(1, 1, 1, self.num_levels, 1, 1)
 
 
         # [bs, all hw, 8, 16]: 4 level 4 sampling points: 16 features total
         attention_weights = self.attention_weights(query).view(
-            bs, num_query, self.num_heads * self.num_levels * self.num_points
+            bs, num_query, self.num_heads, self.num_levels * self.num_points
         )
         attention_weights = attention_weights.softmax(-1)
         attention_weights = attention_weights.view(

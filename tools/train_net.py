@@ -84,7 +84,7 @@ class Trainer(SimpleTrainer):
         Implement the standard training logic described above.
         """
         assert self.model.training, "[Trainer] model was changed to eval mode!"
-        # assert torch.cuda.is_available(), "[Trainer] CUDA is required for AMP training!"
+        assert torch.cuda.is_available(), "[Trainer] CUDA is required for AMP training!"
         from torch.cuda.amp import autocast
 
         start = time.perf_counter()

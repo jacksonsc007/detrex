@@ -12,3 +12,9 @@ In this version, we expand reference points to reference boxes for encoder.
 
 # v1.3
 on the basisi on  v1.2, we limit the sampling points are within the range of box.
+
+
+# v1.3.1
+1. we increase the number of sampling points.
+2. fix tanh bug and use sigmoid
+3. change softmax range from object level to head level.
