@@ -55,7 +55,7 @@ model = L(DNDeformableDETR)(
             ffn_dropout=0.0,
             num_layers=6,
             post_norm=False,
-            num_feature_levels="${..num_feature_levels}",
+            # num_feature_levels="${..num_feature_levels}",
         ),
         decoder=L(DNDeformableDetrTransformerDecoder)(
             embed_dim=256,
@@ -65,7 +65,7 @@ model = L(DNDeformableDETR)(
             ffn_dropout=0.0,
             num_layers=6,
             return_intermediate=True,
-            num_feature_levels="${..num_feature_levels}",
+            # num_feature_levels="${..num_feature_levels}",
         ),
         as_two_stage=False,
         num_feature_levels=4,

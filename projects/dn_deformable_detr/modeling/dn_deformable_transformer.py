@@ -29,7 +29,7 @@ from detrex.layers import (
 from detrex.utils import inverse_sigmoid
 
 
-class DNDeformableDetrTransformerEncoder(TransformerLayerSequence):
+class DNDeformableDetrTransformerEncoder(nn.Module):
     def __init__(
         self,
         embed_dim: int = 256,
@@ -40,16 +40,24 @@ class DNDeformableDetrTransformerEncoder(TransformerLayerSequence):
         operation_order: tuple = ("self_attn", "norm", "ffn", "norm"),
         num_layers: int = 6,
         post_norm: bool = False,
-        num_feature_levels: int = 4,
+        num_input_feature_levels: list = [4, 4, 4, 4, 4, 4]
     ):
-        super(DNDeformableDetrTransformerEncoder, self).__init__(
+        super(DNDeformableDetrTransformerEncoder, self).__init__()
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList()
+        self.layer_location = "encoder"
+        self.num_input_levels = num_input_feature_levels
+        # hack implementation
+        assert len(self.num_input_levels) == self.num_layers
+        for layer_idx in range(num_layers):
+            num_input_feature_lvl = self.num_input_levels[layer_idx]
             transformer_layers=BaseTransformerLayer(
                 attn=MultiScaleDeformableAttention(
                     embed_dim=embed_dim,
                     num_heads=num_heads,
                     dropout=attn_dropout,
                     batch_first=True,
-                    num_levels=num_feature_levels,
+                    num_levels=num_input_feature_lvl,
                 ),
                 ffn=FFN(
                     embed_dim=embed_dim,
@@ -60,12 +68,11 @@ class DNDeformableDetrTransformerEncoder(TransformerLayerSequence):
                 ),
                 norm=nn.LayerNorm(embed_dim),
                 operation_order=operation_order,
-            ),
-            num_layers=num_layers,
-        )
+            )
+            self.layers.append(transformer_layers)
         self.embed_dim = self.layers[0].embed_dim
         self.pre_norm = self.layers[0].pre_norm
-        self.num_layers = len(self.layers)
+
 
         if post_norm:
             self.post_norm_layer = nn.LayerNorm(self.embed_dim)
@@ -132,7 +139,7 @@ class DNDeformableDetrTransformerEncoder(TransformerLayerSequence):
 
 
 
-class DNDeformableDetrTransformerDecoder(TransformerLayerSequence):
+class DNDeformableDetrTransformerDecoder(nn.Module):
     def __init__(
         self,
         embed_dim: int = 256,
@@ -142,9 +149,17 @@ class DNDeformableDetrTransformerDecoder(TransformerLayerSequence):
         ffn_dropout: float = 0.1,
         num_layers: int = 6,
         return_intermediate: bool = True,
-        num_feature_levels: int = 4,
+        num_input_feature_levels: list = [4, 4, 4, 4, 4, 4]
     ):
-        super(DNDeformableDetrTransformerDecoder, self).__init__(
+        super(DNDeformableDetrTransformerDecoder, self).__init__()
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList()
+        self.layer_location = "decoder"
+        self.num_input_levels = num_input_feature_levels
+        # hack implementation
+        assert len(self.num_input_levels) == self.num_layers
+        for layer_idx in range(num_layers):
+            num_input_feature_lvl = self.num_input_levels[layer_idx]
             transformer_layers=BaseTransformerLayer(
                 attn=[
                     MultiheadAttention(
@@ -158,7 +173,7 @@ class DNDeformableDetrTransformerDecoder(TransformerLayerSequence):
                         num_heads=num_heads,
                         dropout=attn_dropout,
                         batch_first=True,
-                        num_levels=num_feature_levels,
+                        num_levels=num_input_feature_lvl,
                     ),
                 ],
                 ffn=FFN(
@@ -169,9 +184,8 @@ class DNDeformableDetrTransformerDecoder(TransformerLayerSequence):
                 ),
                 norm=nn.LayerNorm(embed_dim),
                 operation_order=("self_attn", "norm", "cross_attn", "norm", "ffn", "norm"),
-            ),
-            num_layers=num_layers,
-        )
+            )
+            self.layers.append(transformer_layers)
         self.return_intermediate = return_intermediate
 
         self.query_scale = MLP(embed_dim, embed_dim, embed_dim, 2)
@@ -317,6 +331,8 @@ class DNDeformableDetrTransformer(nn.Module):
         self.num_dec_layers = self.decoder.num_layers
         assert self.num_enc_layers == self.num_dec_layers
         self.num_stages = self.encoder.num_layers
+        self.num_input_levels = [1, 2, 4]
+        assert len(self.num_input_levels) == self.num_stages
 
 
     def init_weights(self):
@@ -433,6 +449,7 @@ class DNDeformableDetrTransformer(nn.Module):
         mask_flatten = []
         lvl_pos_embed_flatten = []
         spatial_shapes = []
+        num_tokens_list = []
         for lvl, (feat, mask, pos_embed) in enumerate(
             zip(multi_level_feats, multi_level_masks, multi_level_pos_embeds)
         ):
@@ -447,18 +464,20 @@ class DNDeformableDetrTransformer(nn.Module):
             lvl_pos_embed_flatten.append(lvl_pos_embed)
             feat_flatten.append(feat)
             mask_flatten.append(mask)
+            num_tokens_list.append(h*w)
         feat_flatten = torch.cat(feat_flatten, 1)
         mask_flatten = torch.cat(mask_flatten, 1)
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
         spatial_shapes = torch.as_tensor(
             spatial_shapes, dtype=torch.long, device=feat_flatten.device
         )
+        self.num_tokens_lvl_list =  num_tokens_list
         level_start_index = torch.cat(
             (spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1])
         )
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in multi_level_masks], 1)
 
-        encoder_reference_points = self.get_reference_points(
+        fixed_encoder_reference_points = self.get_reference_points(
             spatial_shapes, valid_ratios, device=feat.device
         )
 
@@ -472,16 +491,30 @@ class DNDeformableDetrTransformer(nn.Module):
         enc_inter_outputs_coord_unact = []
         init_dec_refs = []
         for stage_id in range(self.num_stages):
+            # ========== select input feature level ==========
+            num_input_lvl = self.num_input_levels[stage_id] # 1 or 2 or 4
+            input_token_start_idx = level_start_index[-num_input_lvl]
+            memory = feat_flatten[:, input_token_start_idx:]
+            encoder_query_key_padding_mask = mask_flatten[:, input_token_start_idx:]
+            encoder_query_pos = lvl_pos_embed_flatten[:, input_token_start_idx:]
+            encoder_reference_points = fixed_encoder_reference_points[:,input_token_start_idx:, -num_input_lvl:]
+            spatial_shapes_per = spatial_shapes[-num_input_lvl:]
+            level_start_index_per = torch.cat( 
+                    [ spatial_shapes_per.new_zeros((1,)), spatial_shapes_per.prod(1).cumsum(0)[:-1] ]
+                ) 
+            # (N, num_levels, 2) -> (N, num_input_lvl, 2)
+            valid_ratios_per = valid_ratios[:, -num_input_lvl:]
+        
             memory, decoder_query, decoder_reference_points, \
             enc_output_cls, enc_output_coord, init_dec_ref = self.cascade_stage(
                 stage_id=stage_id,
                 encoder_query=memory,
                 encoder_key=None,
                 encoder_value=None,
-                encoder_query_pos=lvl_pos_embed_flatten,
+                encoder_query_pos=encoder_query_pos,
                 encoder_key_pos=None,
                 encoder_attn_masks=None,
-                encoder_query_key_padding_mask=mask_flatten,
+                encoder_query_key_padding_mask=encoder_query_key_padding_mask,
                 encoder_key_padding_mask=None,
                 encoder_reference_points=encoder_reference_points,
                 # ------------------------------------------------
@@ -490,12 +523,12 @@ class DNDeformableDetrTransformer(nn.Module):
                 decoder_key_pos=None,
                 decoder_attn_masks=attn_masks,
                 decoder_query_key_padding_mask=None,
-                decoder_key_padding_mask=mask_flatten,
+                decoder_key_padding_mask=encoder_query_key_padding_mask,
                 decoder_reference_points=decoder_reference_points,
                 # ------------------------------------------------
-                spatial_shapes=spatial_shapes,
-                level_start_index=level_start_index,
-                valid_ratios=valid_ratios,
+                spatial_shapes=spatial_shapes_per,
+                level_start_index=level_start_index_per,
+                valid_ratios=valid_ratios_per,
                 # ------------------------------------------------
                 input_box_query=input_box_query,
                 input_label_query=input_label_query,

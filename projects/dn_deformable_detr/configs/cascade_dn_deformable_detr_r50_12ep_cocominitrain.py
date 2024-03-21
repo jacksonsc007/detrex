@@ -36,7 +36,9 @@ dataset_code = "coco_minitrain"
 model.num_classes = 80
 model.criterion.num_classes = 80
 model.transformer.encoder.num_layers=3 
+model.transformer.encoder.num_input_feature_levels = [1, 2, 4]
 model.transformer.decoder.num_layers=3 
+model.transformer.decoder.num_input_feature_levels = [1, 2, 4]
 model.num_queries = 300
 
 model_code = f"DNDETR_num_queries{model.num_queries}_enc{model.transformer.encoder.num_layers}_dec{model.transformer.decoder.num_layers}"
