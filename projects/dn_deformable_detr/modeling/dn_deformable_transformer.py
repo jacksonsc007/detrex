@@ -41,6 +41,7 @@ class DNDeformableDetrTransformerEncoder(TransformerLayerSequence):
         num_layers: int = 6,
         post_norm: bool = False,
         num_feature_levels: int = 4,
+        num_points: int = 16,
     ):
         super(DNDeformableDetrTransformerEncoder, self).__init__(
             transformer_layers=BaseTransformerLayer(
@@ -50,6 +51,7 @@ class DNDeformableDetrTransformerEncoder(TransformerLayerSequence):
                     dropout=attn_dropout,
                     batch_first=True,
                     num_levels=num_feature_levels,
+                    num_points=num_points,
                 ),
                 ffn=FFN(
                     embed_dim=embed_dim,
@@ -143,6 +145,7 @@ class DNDeformableDetrTransformerDecoder(TransformerLayerSequence):
         num_layers: int = 6,
         return_intermediate: bool = True,
         num_feature_levels: int = 4,
+        num_points: int = 16, 
     ):
         super(DNDeformableDetrTransformerDecoder, self).__init__(
             transformer_layers=BaseTransformerLayer(
@@ -159,6 +162,7 @@ class DNDeformableDetrTransformerDecoder(TransformerLayerSequence):
                         dropout=attn_dropout,
                         batch_first=True,
                         num_levels=num_feature_levels,
+                        num_points=num_points,
                     ),
                 ],
                 ffn=FFN(

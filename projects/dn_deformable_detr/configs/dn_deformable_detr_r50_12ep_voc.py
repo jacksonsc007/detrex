@@ -37,9 +37,13 @@ model.num_classes = 20
 model.criterion.num_classes = 20
 model.transformer.encoder.num_layers=3 
 model.transformer.decoder.num_layers=3 
+num_points=4
+model.transformer.encoder.num_points=num_points 
+model.transformer.decoder.num_points=num_points 
 model.num_queries = 300
 
-model_code = f"DNDETR_num_queries{model.num_queries}_enc{model.transformer.encoder.num_layers}_dec{model.transformer.decoder.num_layers}"
+
+model_code = f"DNDETR_num_queries{model.num_queries}_enc{model.transformer.encoder.num_layers}_dec{model.transformer.decoder.num_layers}_numpoints{num_points}"
 
 # ========================================
 # optimizer config

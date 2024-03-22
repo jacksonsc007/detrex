@@ -22,3 +22,6 @@ on the basisi on  v1.2, we limit the sampling points are within the range of box
 
 # v1.3.2
 1. we modify the initialization of bias of the sampling_offset of multi_scale_deformable_attention.
+
+## ablation
+num_points default:16
