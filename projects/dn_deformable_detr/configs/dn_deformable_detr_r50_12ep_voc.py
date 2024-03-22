@@ -10,7 +10,7 @@ if CODE_VERSION is None:
 # ========================================
 # basic setting
 # ========================================
-batch_size = 2
+batch_size = 4
 total_imgs = 16651
 num_epochs = 12
 assert num_epochs == 12
@@ -40,6 +40,17 @@ model.transformer.encoder.num_input_feature_levels = [1, 2, 4]
 model.transformer.decoder.num_layers=3 
 model.transformer.decoder.num_input_feature_levels = [1, 2, 4]
 model.num_queries = 300
+
+# set aux loss weight dict
+if model.aux_loss:
+    weight_dict = model.criterion.weight_dict
+    aux_weight_dict = {}
+    uniform_weight_interval = (1 / model.transformer.decoder.num_layers)
+    for i in range(model.transformer.decoder.num_layers - 1):
+        weight_scalar = uniform_weight_interval * (i + 1)
+        aux_weight_dict.update({k + f"_{i}": weight_scalar * v for k, v in weight_dict.items()})
+    weight_dict.update(aux_weight_dict)
+    model.criterion.weight_dict = weight_dict
 
 model_code = f"DNDETR_num_queries{model.num_queries}_enc{model.transformer.encoder.num_layers}_dec{model.transformer.decoder.num_layers}"
 
