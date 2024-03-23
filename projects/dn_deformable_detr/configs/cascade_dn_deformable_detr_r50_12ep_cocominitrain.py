@@ -10,7 +10,7 @@ if CODE_VERSION is None:
 # ========================================
 # basic setting
 # ========================================
-batch_size = 2
+batch_size = 4
 total_imgs = 25000
 num_epochs = 12
 assert num_epochs == 12
